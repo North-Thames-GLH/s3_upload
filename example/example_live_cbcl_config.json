@@ -1,0 +1,18 @@
+{
+    "max_cores": 4,
+    "max_threads": 4,
+    "max_age": 72,
+    "live_cycle_grace_seconds": 30,
+    "log_level": "INFO",
+    "log_dir": "/tmp/s3_upload_logs",
+    "monitor": [
+        {
+            "monitored_directories": [
+                "/data/rds/DMP/DUDMP/TRANSGEN/sedlawrence/1.runs"
+            ],
+            "bucket": "nt-glh-2",
+            "remote_path": "/RMH/training/",
+            "live_cbcl": true
+        }
+    ]
+}
