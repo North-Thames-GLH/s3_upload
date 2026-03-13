@@ -14,6 +14,131 @@ from .log import get_logger
 log = get_logger("s3_upload")
 
 
+def get_cycle_dirs(basecalls_lane_dir) -> List[Tuple[int, str]]:
+    """
+    Parse cycle directories from a BaseCalls lane directory and return
+    the numeric cycle and full path sorted by cycle number.
+
+    Parameters
+    ----------
+    basecalls_lane_dir : str
+        Path to lane directory under BaseCalls (e.g. .../L001)
+
+    Returns
+    -------
+    list
+        List of tuples of cycle number and full cycle directory path.
+    """
+    cycle_dirs = []
+    cycle_regex = re.compile(r"^C(\d+)\.1$")
+
+    if not path.exists(basecalls_lane_dir):
+        return cycle_dirs
+
+    for item in scandir(basecalls_lane_dir):
+        if not item.is_dir():
+            continue
+        match = cycle_regex.search(item.name)
+        if not match:
+            continue
+        cycle_dirs.append((int(match.group(1)), item.path))
+
+    return sorted(cycle_dirs, key=lambda x: x[0])
+
+
+def get_closed_cycle_dirs(basecalls_lane_dir, grace_seconds=120) -> list:
+    """
+    Return cycle directories considered complete for live transfer.
+
+    A cycle is considered closed when the next cycle directory exists,
+    and all cbcl files in the cycle are older than the provided grace
+    period.
+
+    Parameters
+    ----------
+    basecalls_lane_dir : str
+        Path to lane directory under BaseCalls (e.g. .../L001)
+    grace_seconds : int
+        Minimum age in seconds for cbcl files to consider stable
+
+    Returns
+    -------
+    list
+        Closed cycle directory paths.
+    """
+    cycle_dirs = get_cycle_dirs(basecalls_lane_dir=basecalls_lane_dir)
+    cycle_numbers = set([x[0] for x in cycle_dirs])
+    now = datetime.now().timestamp()
+    closed_cycle_dirs = []
+
+    for cycle_num, cycle_dir in cycle_dirs:
+        if cycle_num + 1 not in cycle_numbers:
+            continue
+
+        cbcl_files = glob(path.join(cycle_dir, "*.cbcl"))
+        if not cbcl_files:
+            continue
+
+        if grace_seconds and any(
+            now - path.getmtime(cbcl_file) < int(grace_seconds)
+            for cbcl_file in cbcl_files
+        ):
+            continue
+
+        closed_cycle_dirs.append(cycle_dir)
+
+    return closed_cycle_dirs
+
+
+def get_live_cbcl_files(run_dir, lanes=None, grace_seconds=120) -> list:
+    """
+    Get cbcl files from closed cycles for all discovered lanes.
+
+    Parameters
+    ----------
+    run_dir : str
+        Path to sequencing run directory
+    lanes : list | None
+        Optional list of lanes to limit to. If not provided all lanes
+        under BaseCalls matching L\\d\\d\\d are auto-discovered.
+    grace_seconds : int
+        Minimum age in seconds for cbcl files to consider stable
+
+    Returns
+    -------
+    list
+        List of cbcl file paths from closed cycle directories
+    """
+    basecalls_dir = path.join(run_dir, "Data", "Intensities", "BaseCalls")
+
+    if not path.exists(basecalls_dir):
+        log.debug("BaseCalls directory not found in %s", run_dir)
+        return []
+
+    if lanes:
+        lanes_to_scan = lanes
+    else:
+        lanes_to_scan = sorted(
+            [
+                x.name
+                for x in scandir(basecalls_dir)
+                if x.is_dir() and re.search(r"^L\d{3}$", x.name)
+            ]
+        )
+
+    cbcl_files = []
+    for lane in lanes_to_scan:
+        lane_dir = path.join(basecalls_dir, lane)
+        closed_cycles = get_closed_cycle_dirs(
+            basecalls_lane_dir=lane_dir, grace_seconds=grace_seconds
+        )
+
+        for cycle_dir in closed_cycles:
+            cbcl_files.extend(glob(path.join(cycle_dir, "*.cbcl")))
+
+    return sorted(cbcl_files)
+
+
 def check_termination_file_exists(run_dir) -> bool:
     """
     Check if the run has completed sequencing from the presence of
@@ -223,6 +348,13 @@ def get_runs_to_upload(
         # if it has completed and if it has been uploaded
         log.info("Checking %s for completed sequencing runs", monitored_dir)
 
+        if not path.exists(monitored_dir):
+            log.warning(
+                "Monitored directory does not exist and will be skipped: %s",
+                monitored_dir,
+            )
+            continue
+
         sub_directories = [
             f.path for f in scandir(monitored_dir) if f.is_dir()
         ]
@@ -307,6 +439,61 @@ def get_runs_to_upload(
                 to_upload.append(sub_dir)
 
     return to_upload, partially_uploaded
+
+
+def get_runs_to_live_upload(monitor_dirs, sample_pattern=None) -> list:
+    """
+    Get active sequencing runs for live cbcl upload.
+
+    Parameters
+    ----------
+    monitor_dirs : list
+        List of directories to scan for sequencing runs
+    sample_pattern : str
+        Optional regex pattern that all sample names must match
+
+    Returns
+    -------
+    list
+        List of active run directories eligible for live cbcl upload
+    """
+    live_runs = []
+
+    for monitored_dir in monitor_dirs:
+        log.info("Checking %s for active sequencing runs", monitored_dir)
+
+        if not path.exists(monitored_dir):
+            log.warning(
+                "Monitored directory does not exist and will be skipped: %s",
+                monitored_dir,
+            )
+            continue
+
+        sub_directories = [
+            f.path for f in scandir(monitored_dir) if f.is_dir()
+        ]
+
+        for sub_dir in sub_directories:
+            if not check_is_sequencing_run_dir(sub_dir):
+                continue
+
+            if check_termination_file_exists(sub_dir):
+                # run completed; this will be handled by regular monitor mode
+                continue
+
+            samplesheet_contents = read_samplesheet_from_run_directory(sub_dir)
+            if not samplesheet_contents:
+                continue
+
+            if sample_pattern and not check_all_uploadable_samples(
+                samplesheet_contents=samplesheet_contents,
+                sample_pattern=sample_pattern,
+            ):
+                continue
+
+            live_runs.append(sub_dir)
+
+    return live_runs
 
 
 def get_sequencing_file_list(seq_dir, exclude_patterns=None) -> list:
@@ -494,6 +681,14 @@ def verify_config(config) -> None:
     if not isinstance(config.get("max_age", 0), int):
         errors.append("max_age must be a positive integer")
 
+    if not isinstance(config.get("live_cycle_grace_seconds", 0), int):
+        errors.append("live_cycle_grace_seconds must be a positive integer")
+
+    if not isinstance(
+        config.get("live_cbcl_finalize_completed_runs", True), bool
+    ):
+        errors.append("live_cbcl_finalize_completed_runs must be a boolean")
+
     if config.get("log_level"):
         level = config.get("log_level")
         valid_str_levels = [
@@ -541,6 +736,22 @@ def verify_config(config) -> None:
                     "Invalid regex pattern provided in monitor section "
                     f"{idx}: {monitor.get('sample_regex')}"
                 )
+
+        if "live_cbcl" in monitor and not isinstance(
+            monitor.get("live_cbcl"), bool
+        ):
+            errors.append(
+                "live_cbcl not of expected type from monitor section "
+                f"{idx}. Expected: {bool} | Found {type(monitor.get('live_cbcl'))}"
+            )
+
+        if monitor.get("live_lanes") and not isinstance(
+            monitor.get("live_lanes"), list
+        ):
+            errors.append(
+                "live_lanes not of expected type from monitor section "
+                f"{idx}. Expected: {list} | Found {type(monitor.get('live_lanes'))}"
+            )
 
     if errors:
         error_message = (

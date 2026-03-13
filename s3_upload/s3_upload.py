@@ -7,6 +7,8 @@ from timeit import default_timer as timer
 from utils.io import (
     acquire_lock,
     read_config,
+    read_live_upload_state_log,
+    write_live_upload_state_to_log,
     write_upload_state_to_log,
 )
 from utils.upload import (
@@ -17,6 +19,8 @@ from utils.upload import (
 from utils.utils import (
     check_is_sequencing_run_dir,
     check_termination_file_exists,
+    get_live_cbcl_files,
+    get_runs_to_live_upload,
     get_runs_to_upload,
     get_sequencing_file_list,
     filter_uploaded_files,
@@ -64,6 +68,37 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Calls everything except the actual upload to check what runs"
             " would be uploaded"
+        ),
+    )
+
+    live_parser = subparsers.add_parser(
+        "live_cbcl",
+        help=(
+            "Mode to be run on a schedule to upload cbcl files from"
+            " in-progress sequencing runs"
+        ),
+    )
+    live_parser.add_argument(
+        "--config",
+        required=True,
+        help="Config file for monitoring directories to upload",
+    )
+    live_parser.add_argument(
+        "--dry_run",
+        default=False,
+        action="store_true",
+        help=(
+            "Calls everything except the actual upload to check what cbcl"
+            " files would be uploaded"
+        ),
+    )
+    live_parser.add_argument(
+        "--grace_seconds",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for minimum file age in seconds to consider"
+            " cbcl files from closed cycles stable for upload"
         ),
     )
 
@@ -206,7 +241,7 @@ def monitor_directories_for_upload(config, dry_run) -> None:
         slack_alert_webhook=alert_url,
     )
 
-    cores = config.get("max_cores", cpu_count)
+    cores = config.get("max_cores", cpu_count())
     threads = config.get("max_threads", 4)
     log_dir = config.get("log_dir", "/var/log/s3_upload")
 
@@ -379,6 +414,192 @@ def monitor_directories_for_upload(config, dry_run) -> None:
         slack.post_message(url=alert_url, message=message)
 
 
+def monitor_directories_for_live_cbcl_upload(
+    config, dry_run, grace_seconds=None
+) -> None:
+    """
+    Monitor specified directories for active sequencing runs and upload
+    cbcl files from closed cycle directories.
+
+    Parameters
+    ----------
+    config : dict
+        contents of config file
+    dry_run : bool
+        calls everything except the actual upload for testing / debugging
+    grace_seconds : int | None
+        optional override for cbcl file age threshold
+    """
+    log.info("Beginning monitoring directories for live cbcl upload")
+
+    log_url = config.get("slack_log_webhook") or config.get(
+        "slack_alert_webhook"
+    )
+    alert_url = config.get("slack_alert_webhook") or config.get(
+        "slack_log_webhook"
+    )
+
+    if not log_url and not alert_url:
+        log.warning(
+            "Neither `slack_log_webhook` or `slack_alert_webhook` specified =>"
+            " no Slack notifications will be sent"
+        )
+
+    check_aws_access(slack_alert_webhook=alert_url)
+    check_buckets_exist(
+        buckets=set([x["bucket"] for x in config["monitor"]]),
+        slack_alert_webhook=alert_url,
+    )
+
+    cores = config.get("max_cores", cpu_count())
+    threads = config.get("max_threads", 4)
+    log_dir = config.get("log_dir", "/var/log/s3_upload")
+
+    runs_to_upload = []
+
+    for monitor_dir_config in config["monitor"]:
+        if monitor_dir_config.get("live_cbcl") is False:
+            continue
+
+        live_runs = get_runs_to_live_upload(
+            monitor_dirs=monitor_dir_config.get("monitored_directories"),
+            sample_pattern=monitor_dir_config.get("sample_regex"),
+        )
+
+        for run_dir in live_runs:
+            runs_to_upload.append(
+                {
+                    "run_dir": run_dir,
+                    "run_id": Path(run_dir).name,
+                    "parent_path": Path(run_dir).parent,
+                    "bucket": monitor_dir_config["bucket"],
+                    "remote_path": monitor_dir_config["remote_path"],
+                    "live_lanes": monitor_dir_config.get("live_lanes"),
+                    "grace_seconds": grace_seconds
+                    if grace_seconds is not None
+                    else monitor_dir_config.get(
+                        "live_cycle_grace_seconds",
+                        config.get("live_cycle_grace_seconds", 120),
+                    ),
+                }
+            )
+
+    if not runs_to_upload:
+        log.info("No active sequencing runs requiring live cbcl upload found.")
+    else:
+        log.info(
+            "Found %s active runs for live cbcl upload: %s",
+            len(runs_to_upload),
+            ", ".join([x["run_id"] for x in runs_to_upload]),
+        )
+
+    runs_successfully_uploaded = []
+    runs_failed_upload = []
+
+    for idx, run_config in enumerate(runs_to_upload, 1):
+        log.info(
+            "Uploading live cbcl for run %s [%s/%s]",
+            run_config["run_id"],
+            idx,
+            len(runs_to_upload),
+        )
+
+        run_log_file = path.join(
+            log_dir, f"uploads/{run_config['run_id']}.live_cbcl.upload.log.json"
+        )
+
+        all_cbcl_files = get_live_cbcl_files(
+            run_dir=run_config["run_dir"],
+            lanes=run_config.get("live_lanes"),
+            grace_seconds=run_config["grace_seconds"],
+        )
+
+        if not all_cbcl_files:
+            log.info("No closed-cycle cbcl files available for %s", run_config["run_id"])
+            continue
+
+        previously_uploaded = []
+        if path.exists(run_log_file):
+            state = read_live_upload_state_log(run_log_file)
+            previously_uploaded = [
+                local_file
+                for lane_data in state.get("lanes", {}).values()
+                for local_file in lane_data.get("uploaded_files", {})
+            ]
+
+        files_to_upload = filter_uploaded_files(
+            local_files=all_cbcl_files, uploaded_files=previously_uploaded
+        )
+
+        if not files_to_upload:
+            log.info(
+                "No new closed-cycle cbcl files to upload for %s",
+                run_config["run_id"],
+            )
+            continue
+
+        if dry_run:
+            log.info(
+                "%s cbcl files would be uploaded for %s to %s:%s",
+                len(files_to_upload),
+                run_config["run_id"],
+                run_config["bucket"],
+                path.join(run_config["remote_path"], run_config["run_id"]),
+            )
+            continue
+
+        files_to_upload = split_file_list_by_cores(files=files_to_upload, n=cores)
+        uploaded_files, failed_upload = multi_core_upload(
+            files=files_to_upload,
+            bucket=run_config["bucket"],
+            remote_path=run_config["remote_path"],
+            cores=cores,
+            threads=threads,
+            parent_path=run_config["parent_path"],
+        )
+
+        makedirs(path.join(log_dir, "uploads"), exist_ok=True)
+        log_data = write_live_upload_state_to_log(
+            run_id=run_config["run_id"],
+            run_path=run_config["run_dir"],
+            log_file=run_log_file,
+            uploaded_files=uploaded_files,
+            failed_files=failed_upload,
+        )
+
+        if failed_upload:
+            runs_failed_upload.append(log_data["run_id"])
+        else:
+            runs_successfully_uploaded.append(log_data["run_id"])
+
+    if dry_run:
+        log.info("--dry_run specified, skipping upload and continuing to finalisation checks")
+
+    log.info(
+        "Completed live cbcl upload pass, %s runs without upload errors, %s runs"
+        " with upload errors",
+        len(runs_successfully_uploaded),
+        len(runs_failed_upload),
+    )
+
+    if runs_successfully_uploaded and log_url:
+        message = slack.format_message(completed=runs_successfully_uploaded)
+        slack.post_message(url=log_url, message=message)
+
+    if runs_failed_upload and alert_url:
+        message = slack.format_message(failed=runs_failed_upload)
+        slack.post_message(url=alert_url, message=message)
+
+    # Finalise completed runs in the same pass so top-level metadata files
+    # (e.g. RunInfo.xml/SampleSheet.csv/CopyComplete.txt) are uploaded after
+    # run termination without requiring a separate monitor invocation.
+    if config.get("live_cbcl_finalize_completed_runs", True):
+        log.info(
+            "Checking for completed runs requiring final upload in monitor mode"
+        )
+        monitor_directories_for_upload(config=config, dry_run=dry_run)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -389,6 +610,7 @@ def main() -> None:
         verify_config(config=config)
 
         log_dir = config.get("log_dir", "/var/log/s3_upload")
+        makedirs(log_dir, exist_ok=True)
         acquire_lock(lock_file=path.join(log_dir, "s3_upload.lock"))
 
         if config.get("log_level"):
@@ -396,7 +618,14 @@ def main() -> None:
 
         set_file_handler(log, log_dir=log_dir)
 
-        monitor_directories_for_upload(config=config, dry_run=args.dry_run)
+        if args.mode == "monitor":
+            monitor_directories_for_upload(config=config, dry_run=args.dry_run)
+        else:
+            monitor_directories_for_live_cbcl_upload(
+                config=config,
+                dry_run=args.dry_run,
+                grace_seconds=args.grace_seconds,
+            )
 
 
 if __name__ == "__main__":

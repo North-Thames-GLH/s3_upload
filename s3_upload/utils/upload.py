@@ -21,6 +21,7 @@ from .slack import post_message as post_slack_message
 AWS_DEFAULT_PROFILE = environ.get("AWS_DEFAULT_PROFILE")
 AWS_SECRET_KEY = environ.get("AWS_SECRET_KEY")
 AWS_ACCESS_KEY = environ.get("AWS_ACCESS_KEY")
+AWS_S3_ENDPOINT_URL = environ.get("AWS_S3_ENDPOINT_URL")
 
 log = get_logger("s3_upload")
 
@@ -98,7 +99,7 @@ def check_aws_access(slack_alert_webhook=None) -> List[dict]:
                 aws_secret_access_key=AWS_SECRET_KEY,
                 profile_name=AWS_DEFAULT_PROFILE,
             )
-            .resource("s3")
+            .resource("s3", endpoint_url=AWS_S3_ENDPOINT_URL)
             .buckets.all()
         )
     except Exception as err:
@@ -150,7 +151,7 @@ def check_buckets_exist(buckets, slack_alert_webhook=None) -> List[dict]:
                     aws_secret_access_key=AWS_SECRET_KEY,
                     profile_name=AWS_DEFAULT_PROFILE,
                 )
-                .client("s3")
+                .client("s3", endpoint_url=AWS_S3_ENDPOINT_URL)
                 .head_bucket(Bucket=bucket)
             )
         except s3_exceptions.ClientError:
@@ -319,6 +320,7 @@ def multi_thread_upload(
     )
     s3_client = session.client(
         "s3",
+        endpoint_url=AWS_S3_ENDPOINT_URL,
         config=Config(
             retries={"total_max_attempts": 10, "mode": "standard"},
             disable_request_compression=True,

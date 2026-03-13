@@ -7,6 +7,8 @@ Uploads Illumina sequencing runs into AWS S3 storage.
 
 There are 2 modes implemented, one to interactively upload a single sequencing run, and another to monitor on a schedule (i.e. via cron) one or more directories for newly completed sequencing runs and automatically upload into a given S3 bucket location.
 
+A third mode `live_cbcl` is also implemented to monitor in-progress sequencing runs and upload `.cbcl` files from closed cycle directories while the run is still active.
+
 All behaviour for the monitor mode is controlled by a JSON config file (described [below](https://github.com/eastgenomics/s3_upload?tab=readme-ov-file#config)). It is intended to be set up to run on a schedule and monitor one or more directories for newly completed sequencing runs and automatically upload to specified AWS S3 bucket(s) and remote path(s). Multiple local and remote paths may be specified to monitor the output of multiple sequencers. Runs to upload may currently be filtered with regex patterns to match against the samples parsed from the samplesheet, where the sample names are informative of the assay / experiment to be uploaded.
 
 ## :desktop_computer: Usage
@@ -21,6 +23,11 @@ python3 s3_upload/s3_upload.py upload \
 Adding to a crontab for hourly monitoring:
 ```
 0 * * * * python3 s3_upload/s3_upload.py monitor --config /path/to/config.json
+```
+
+Adding to a crontab for live cbcl transfer every 5 minutes:
+```
+*/5 * * * * python3 s3_upload/s3_upload.py live_cbcl --config /path/to/config.json
 ```
 
 
@@ -39,6 +46,11 @@ Available inputs for `monitor`:
 * `--config`: path to JSON config file for monitoring (see Config section below)
 * `--dry_run` (optional): calls everything except the actual upload to check what runs would be uploaded
 
+Available inputs for `live_cbcl`:
+* `--config`: path to JSON config file for monitoring (see Config section below)
+* `--dry_run` (optional): calls everything except the actual upload to check what `.cbcl` files would be uploaded
+* `--grace_seconds` (optional): override minimum age in seconds for `.cbcl` files to be considered stable for upload
+
 
 ## :gear: Config
 
@@ -48,6 +60,7 @@ The top level keys that may be defined include:
 * `max_cores` (`int` | optional): maximum number of CPU cores to split uploading across (default: maximum available)
 * `max_threads` (`int` | optional): the maximum number of threads to use per CPU core
 * `max_age` (`int` | optional): maximum age in hours of a complete run to monitor for upload, determined from mtime of `RunInfo.xml` (default: 72h). For example, setting `max_age: 48` will only upload runs created (or `RunInfo.xml` modified) within the last 48 hours.
+* `live_cycle_grace_seconds` (`int` | optional): minimum age in seconds for `.cbcl` files from closed cycles to be considered stable for `live_cbcl` upload (default: 120)
 * `log_level` (`str` | optional): the level of logging to set, available options are defined [here](https://docs.python.org/3/library/logging.html#logging-levels)
 * `log_dir` (`str` | optional): path to where to store logs (default: `/var/log/s3_upload`)
 * `slack_log_webhook` (`str` | optional): Slack webhook URL to use for sending notifications on successful uploads, will try use `slack_alert_webhook` if not specified (see [Slack](https://github.com/eastgenomics/s3_upload?tab=readme-ov-file#slack) below for details).
@@ -60,6 +73,9 @@ Monitoring of specified directories for sequencing runs to upload are defined in
 * `remote_path` (`str` | required): parent path in which to upload sequencing run directories in the specified bucket
 * `sample_regex` (`str` | optional): regex pattern to match against all samples parsed from the samplesheet, all samples must match this pattern to upload the run. This is to be used for controlling upload of specific runs where samplenames inform the assay / test.
 * `exclude_patterns` (`list` | optional): list of directory / filename regex patterns of which to exclude from uploading (e.g. `[".*png"]` would exclude the PNGs from `Thumbnail_Images/` from being uploaded)
+* `live_cbcl` (`bool` | optional): whether this monitor section should be used in `live_cbcl` mode (default: `true`)
+* `live_lanes` (`list` | optional): optional lane list to restrict `live_cbcl` (e.g. `["L001", "L002"]`); if not set, lanes are auto-discovered from `BaseCalls/L###`
+* `live_cycle_grace_seconds` (`int` | optional): monitor-level override for live `.cbcl` grace period in seconds
 
 Each dictionary inside of the list to monitor allows for setting separate upload locations for each of the monitored directories. For example, in the below codeblock the output of both `sequencer_1` and `sequencer_2` would be uploaded to the root of `bucket_A`, and the output of `sequencer_3` would be uploaded into `sequencer_3_runs` in `bucket_B`. Any number of these dictionaries may be defined in the monitor list.
 
@@ -95,6 +111,8 @@ Each dictionary inside of the list to monitor allows for setting separate upload
 Authentication with AWS may be performed either via SSO / IAM or with specified access keys. If using SSO / IAM, it must first be configured using the [aws cli](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html#sso-configure-profile-token-auto-sso), and then the profile being used set to the environment variable `AWS_DEFAULT_PROFILE`. If this is specified the uploader will attempt to authenticate using this profile which must have permission to access the specified S3 bucket. If using access keys, both the environment variables `AWS_ACCESS_KEY` and `AWS_SECRET_KEY` must be set, and these will be used for authentication. If running via the provided Docker image these may be set using `--env` or `--env-file`.
 
 Only one authentication method may be used, if both `AWS_DEFAULT_PROFILE` and `AWS_ACCESS_KEY` / `AWS_SECRET_KEY` are provided the uploader will exit and one method must be unset to continue.
+
+An optional environment variable `AWS_S3_ENDPOINT_URL` may be set to target an S3-compatible endpoint (e.g. LocalStack or MinIO) for local integration testing.
 
 
 ## :wood: Logging
@@ -187,6 +205,28 @@ To enable Slack notifications, one or both of the keys `slack_log_webhook` and `
 Comprehensive unit tests have been written in [tests/unit](https://github.com/eastgenomics/s3_upload/tree/main/tests/unit) for all the core functionality of the uploader. These are configured to run with PyTest on every change with [GitHub actions](https://github.com/eastgenomics/s3_upload/blob/main/.github/workflows/pytest.yml).
 
 Several [end to end test scenarios](https://github.com/eastgenomics/s3_upload/tree/main/tests/e2e) have also been written to provide robust and automated end to end testing. These are currently not configured to run via GitHub actions due to requiring authentication with AWS. Details on running the tests may be found in the [e2e test readme](https://github.com/eastgenomics/s3_upload/blob/main/tests/e2e/README.md). These should be run locally when changes are made and updated accordingly.
+
+
+## :test_tube: Live CBCL Simulation
+The script `scripts/simulate_live_cbcl_run.py` can generate a fake sequencing run and create cycle directories with `.cbcl` files incrementally.
+
+Example (terminal 1):
+```
+python3 scripts/simulate_live_cbcl_run.py \
+    --run_dir /tmp/s3_upload_simulation/runs/250220_A00420_1457_AHKGJYDRX7 \
+    --lanes 2 \
+    --cycles 40 \
+    --interval_seconds 3 \
+    --write_termination_file
+```
+
+Run live uploader in parallel (terminal 2):
+```
+python3 s3_upload/s3_upload.py live_cbcl \
+    --config example/example_live_cbcl_config.json
+```
+
+The example config `example/example_live_cbcl_config.json` can be used as a template and points by default to `/tmp/s3_upload_simulation/runs`.
 
 
 ## :pen: Notes

@@ -290,15 +290,138 @@ def write_upload_state_to_log(
         **uploaded_files,
     }
 
-    if (
-        total_failed_upload == 0
-        and total_local_files == log_data["total_uploaded_files"]
-    ):
+    expected_files = set(local_files)
+    uploaded_files_set = set(log_data["uploaded_files"].keys())
+
+    if total_failed_upload == 0 and expected_files == uploaded_files_set:
         log.info(
             "All local files uploaded and no files failed uploading, run"
             " completed uploading"
         )
         log_data["completed"] = True
+    elif total_failed_upload == 0:
+        missing_files = sorted(list(expected_files - uploaded_files_set))
+        unexpected_files = sorted(list(uploaded_files_set - expected_files))
+
+        log.warning(
+            "Run not marked complete: uploaded file set does not match local "
+            "file set (missing: %s | unexpected: %s)",
+            len(missing_files),
+            len(unexpected_files),
+        )
+        if missing_files:
+            log.debug("Missing files from upload state: %s", missing_files)
+        if unexpected_files:
+            log.debug(
+                "Unexpected files in upload state (not in local file list): %s",
+                unexpected_files,
+            )
+
+    with open(log_file, "w") as fh:
+        json.dump(log_data, fh, indent=4)
+
+    return log_data
+
+
+def read_live_upload_state_log(log_file) -> dict:
+    """
+    Read live cbcl upload state log for a run.
+
+    Parameters
+    ----------
+    log_file : str
+        Path to live upload state log
+
+    Returns
+    -------
+    dict
+        Contents of live upload state log
+    """
+    log.debug("Reading live upload state from log file: %s", log_file)
+    with open(log_file) as fh:
+        return json.load(fh)
+
+
+def write_live_upload_state_to_log(
+    run_id, run_path, log_file, uploaded_files, failed_files
+) -> dict:
+    """
+    Write/update state of live cbcl uploads for the given run.
+
+    Parameters
+    ----------
+    run_id : str
+        ID of sequencing run
+    run_path : str
+        Path to run directory being uploaded
+    log_file : str
+        File to write log to
+    uploaded_files : dict
+        Mapping of local file path to remote object ID for this attempt
+    failed_files : list
+        List of files that failed to upload in this attempt
+
+    Returns
+    -------
+    dict
+        Full updated live upload state
+    """
+    if os.path.exists(log_file):
+        with open(log_file, "r") as fh:
+            log_data = json.load(fh)
+    else:
+        log_data = {
+            "run_id": run_id,
+            "run_path": run_path,
+            "updated_at": "",
+            "total_uploaded_files": 0,
+            "total_failed_upload": 0,
+            "failed_upload_files": [],
+            "lanes": {},
+        }
+
+    lane_cycle_pattern = re.compile(r"/(L\d{3})/(C(\d+)\.1)/")
+
+    for local_file, etag in uploaded_files.items():
+        match = lane_cycle_pattern.search(local_file)
+        if not match:
+            continue
+
+        lane = match.group(1)
+        cycle_dir = match.group(2)
+        cycle_num = int(match.group(3))
+
+        if lane not in log_data["lanes"]:
+            log_data["lanes"][lane] = {
+                "max_closed_cycle_uploaded": 0,
+                "uploaded_cycles": [],
+                "uploaded_files": {},
+            }
+
+        lane_data = log_data["lanes"][lane]
+        lane_data["uploaded_files"][local_file] = etag
+
+        if cycle_dir not in lane_data["uploaded_cycles"]:
+            lane_data["uploaded_cycles"].append(cycle_dir)
+
+        if cycle_num > lane_data["max_closed_cycle_uploaded"]:
+            lane_data["max_closed_cycle_uploaded"] = cycle_num
+
+    for lane in log_data["lanes"]:
+        lane_data = log_data["lanes"][lane]
+        lane_data["uploaded_cycles"] = sorted(
+            lane_data["uploaded_cycles"],
+            key=lambda x: int(re.search(r"^C(\d+)\.1$", x).group(1)),
+        )
+
+    total_uploaded_files = sum(
+        len(x.get("uploaded_files", {})) for x in log_data["lanes"].values()
+    )
+
+    log_data["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+    log_data["total_uploaded_files"] = total_uploaded_files
+    log_data["total_failed_upload"] = len(failed_files)
+    log_data["failed_upload_files"] = failed_files
 
     with open(log_file, "w") as fh:
         json.dump(log_data, fh, indent=4)
