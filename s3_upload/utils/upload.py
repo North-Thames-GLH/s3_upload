@@ -321,8 +321,6 @@ def multi_thread_upload(
         endpoint_url=AWS_S3_ENDPOINT_URL,
         config=Config(
             retries={"total_max_attempts": 10, "mode": "standard"},
-            disable_request_compression=True,
-            tcp_keepalive=True,
             max_pool_connections=100,
         ),
     )
