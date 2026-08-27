@@ -26,20 +26,33 @@ AWS_S3_ENDPOINT_URL = environ.get("AWS_S3_ENDPOINT_URL")
 log = get_logger("s3_upload")
 
 
-def _build_boto3_session(aws_profile=None):
+def _build_boto3_session(aws_profile=None, aws_credentials=None):
     """
-    Build a boto3 session using either an explicit profile or env vars.
+    Build a boto3 session using either an explicit profile, pre-resolved
+    credentials, or env vars.
 
     Parameters
     ----------
     aws_profile : str | None
         Optional AWS profile name to use instead of AWS_DEFAULT_PROFILE.
+    aws_credentials : dict | None
+        Optional dict with pre-resolved credentials containing
+        access_key, secret_key, and optionally token. Used to pass
+        credentials to child processes that cannot invoke credential
+        helpers.
 
     Returns
     -------
     boto3.session.Session
         Configured boto3 session
     """
+    if aws_credentials:
+        return boto3.Session(
+            aws_access_key_id=aws_credentials["access_key"],
+            aws_secret_access_key=aws_credentials["secret_key"],
+            aws_session_token=aws_credentials.get("token"),
+        )
+
     profile_name = aws_profile or AWS_DEFAULT_PROFILE
 
     if profile_name:
@@ -49,6 +62,40 @@ def _build_boto3_session(aws_profile=None):
         aws_access_key_id=AWS_ACCESS_KEY,
         aws_secret_access_key=AWS_SECRET_KEY,
     )
+
+
+def _resolve_credentials(aws_profile=None):
+    """
+    Resolve AWS credentials from the given profile or environment,
+    returning a dict that can be passed to child processes.
+
+    Parameters
+    ----------
+    aws_profile : str | None
+        Optional AWS profile name
+
+    Returns
+    -------
+    dict
+        dict with access_key, secret_key, and optionally token
+    """
+    session = _build_boto3_session(aws_profile=aws_profile)
+    credentials = session.get_credentials()
+
+    if credentials is None:
+        raise RuntimeError("Failed to resolve AWS credentials")
+
+    frozen = credentials.get_frozen_credentials()
+
+    resolved = {
+        "access_key": frozen.access_key,
+        "secret_key": frozen.secret_key,
+    }
+
+    if frozen.token:
+        resolved["token"] = frozen.token
+
+    return resolved
 
 
 def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> None:
@@ -276,7 +323,8 @@ def _submit_to_pool(pool, func, item_input, items, **kwargs) -> dict:
 
 
 def multi_thread_upload(
-    files, bucket, remote_path, threads, parent_path, aws_profile=None
+    files, bucket, remote_path, threads, parent_path, aws_credentials=None,
+    aws_profile=None
 ) -> Tuple[Dict[str, str], list]:
     """
     Uploads the given set of `files` to S3 on a single CPU core using
@@ -315,7 +363,9 @@ def multi_thread_upload(
     """
     log.info("Uploading %s files with %s threads", len(files), threads)
 
-    session = _build_boto3_session(aws_profile=aws_profile)
+    session = _build_boto3_session(
+        aws_profile=aws_profile, aws_credentials=aws_credentials
+    )
     s3_client = session.client(
         "s3",
         endpoint_url=AWS_S3_ENDPOINT_URL,
@@ -397,6 +447,11 @@ def multi_core_upload(
     all_uploaded_files = {}
     all_failed_upload = []
 
+    # Resolve credentials in the parent process so child processes
+    # don't need to invoke the credential helper (which may not work
+    # across process boundaries with signing helpers like Roles Anywhere)
+    aws_credentials = _resolve_credentials(aws_profile=aws_profile)
+
     pool_executor = ProcessPoolExecutor(max_workers=cores)
     concurrent_jobs = _submit_to_pool(
         pool=pool_executor,
@@ -407,7 +462,7 @@ def multi_core_upload(
         remote_path=remote_path,
         parent_path=parent_path,
         threads=threads,
-        aws_profile=aws_profile,
+        aws_credentials=aws_credentials,
     )
 
     for future in as_completed(concurrent_jobs):
