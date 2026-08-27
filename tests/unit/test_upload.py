@@ -45,6 +45,26 @@ class TestCheckAwsAccess(unittest.TestCase):
 
     @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", None)
     @patch("s3_upload.utils.upload.AWS_SECRET_KEY", None)
+    @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", None)
+    def test_list_of_buckets_returned_on_aws_being_accessible_w_profile_from_config(
+        self, mock_s3, mock_slack
+    ):
+        mock_s3.return_value.resource.return_value.buckets.all.return_value = [
+            "bucket_1",
+            "bucket_2",
+        ]
+
+        returned_buckets = upload.check_aws_access(
+            aws_profile="genomics-s3-write"
+        )
+
+        self.assertEqual(returned_buckets, ["bucket_1", "bucket_2"])
+        self.assertEqual(
+            mock_s3.call_args.kwargs["profile_name"], "genomics-s3-write"
+        )
+
+    @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", None)
+    @patch("s3_upload.utils.upload.AWS_SECRET_KEY", None)
     @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", "baz")
     def test_runtime_error_raised_on_not_being_able_to_connect(
         self, mock_s3, mock_slack

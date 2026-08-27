@@ -3,6 +3,7 @@
     "max_threads": 4,
     "max_age": 72,
     "live_cycle_grace_seconds": 30,
+    "aws_profile": "genomics-s3-write",
     "log_level": "INFO",
     "log_dir": "/tmp/s3_upload_logs",
     "monitor": [

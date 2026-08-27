@@ -61,6 +61,7 @@ The top level keys that may be defined include:
 * `max_threads` (`int` | optional): the maximum number of threads to use per CPU core
 * `max_age` (`int` | optional): maximum age in hours of a complete run to monitor for upload, determined from mtime of `RunInfo.xml` (default: 72h). For example, setting `max_age: 48` will only upload runs created (or `RunInfo.xml` modified) within the last 48 hours.
 * `live_cycle_grace_seconds` (`int` | optional): minimum age in seconds for `.cbcl` files from closed cycles to be considered stable for `live_cbcl` upload (default: 120)
+* `aws_profile` (`str` | optional): AWS profile name to use with boto3, for example `genomics-s3-write`
 * `log_level` (`str` | optional): the level of logging to set, available options are defined [here](https://docs.python.org/3/library/logging.html#logging-levels)
 * `log_dir` (`str` | optional): path to where to store logs (default: `/var/log/s3_upload`)
 * `slack_log_webhook` (`str` | optional): Slack webhook URL to use for sending notifications on successful uploads, will try use `slack_alert_webhook` if not specified (see [Slack](https://github.com/eastgenomics/s3_upload?tab=readme-ov-file#slack) below for details).
@@ -108,7 +109,7 @@ Each dictionary inside of the list to monitor allows for setting separate upload
 
 ## :closed_lock_with_key: AWS Authentication
 
-Authentication with AWS may be performed either via SSO / IAM or with specified access keys. If using SSO / IAM, it must first be configured using the [aws cli](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html#sso-configure-profile-token-auto-sso), and then the profile being used set to the environment variable `AWS_DEFAULT_PROFILE`. If this is specified the uploader will attempt to authenticate using this profile which must have permission to access the specified S3 bucket. If using access keys, both the environment variables `AWS_ACCESS_KEY` and `AWS_SECRET_KEY` must be set, and these will be used for authentication. If running via the provided Docker image these may be set using `--env` or `--env-file`.
+Authentication with AWS may be performed either via SSO / IAM or with specified access keys. If using SSO / IAM, it must first be configured using the [aws cli](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html#sso-configure-profile-token-auto-sso), and then the profile name can be set either in the environment variable `AWS_DEFAULT_PROFILE` or in the config JSON via `aws_profile`. If this is specified the uploader will attempt to authenticate using this profile which must have permission to access the specified S3 bucket. If using access keys, both the environment variables `AWS_ACCESS_KEY` and `AWS_SECRET_KEY` must be set, and these will be used for authentication. If running via the provided Docker image these may be set using `--env` or `--env-file`.
 
 Only one authentication method may be used, if both `AWS_DEFAULT_PROFILE` and `AWS_ACCESS_KEY` / `AWS_SECRET_KEY` are provided the uploader will exit and one method must be unset to continue.
 
@@ -227,6 +228,12 @@ python3 s3_upload/s3_upload.py live_cbcl \
 ```
 
 The example config `example/example_live_cbcl_config.json` can be used as a template and points by default to `/tmp/s3_upload_simulation/runs`.
+
+If you want to use an AWS CLI profile, set `aws_profile` in the config JSON to the profile name. For example:
+
+```json
+"aws_profile": "genomics-s3-write"
+```
 
 
 ## :pen: Notes

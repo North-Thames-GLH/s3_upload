@@ -26,7 +26,32 @@ AWS_S3_ENDPOINT_URL = environ.get("AWS_S3_ENDPOINT_URL")
 log = get_logger("s3_upload")
 
 
-def check_aws_access(slack_alert_webhook=None) -> List[dict]:
+def _build_boto3_session(aws_profile=None):
+    """
+    Build a boto3 session using either an explicit profile or env vars.
+
+    Parameters
+    ----------
+    aws_profile : str | None
+        Optional AWS profile name to use instead of AWS_DEFAULT_PROFILE.
+
+    Returns
+    -------
+    boto3.session.Session
+        Configured boto3 session
+    """
+    profile_name = aws_profile or AWS_DEFAULT_PROFILE
+
+    if profile_name:
+        return boto3.Session(profile_name=profile_name)
+
+    return boto3.Session(
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+    )
+
+
+def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> List[dict]:
     """
     Check authentication with AWS S3 with stored credentials by checking
     access to all buckets
@@ -59,17 +84,18 @@ def check_aws_access(slack_alert_webhook=None) -> List[dict]:
         ":warning:  *S3 Upload*: Error in connecting to AWS!\n\n"
     )
 
-    if AWS_DEFAULT_PROFILE and (AWS_ACCESS_KEY or AWS_SECRET_KEY):
+    if aws_profile is None and AWS_DEFAULT_PROFILE and (
+        AWS_ACCESS_KEY or AWS_SECRET_KEY
+    ):
         error_message = (
             "Both `AWS_DEFAULT_PROFILE` provided as well as `AWS_ACCESS_KEY`"
             " and / or `AWS_SECRET_KEY`. Only one authentication method may be"
             " used."
         )
 
-    if AWS_DEFAULT_PROFILE:
+    if aws_profile or AWS_DEFAULT_PROFILE:
         log.info(
-            "Environment variable AWS_DEFAULT_PROFILE defined, will be used"
-            " for authentication"
+            "AWS profile defined, will be used for authentication"
         )
     elif AWS_ACCESS_KEY and AWS_SECRET_KEY:
         log.info(
@@ -94,12 +120,9 @@ def check_aws_access(slack_alert_webhook=None) -> List[dict]:
 
     try:
         return list(
-            boto3.Session(
-                aws_access_key_id=AWS_ACCESS_KEY,
-                aws_secret_access_key=AWS_SECRET_KEY,
-                profile_name=AWS_DEFAULT_PROFILE,
+            _build_boto3_session(aws_profile=aws_profile).resource(
+                "s3", endpoint_url=AWS_S3_ENDPOINT_URL
             )
-            .resource("s3", endpoint_url=AWS_S3_ENDPOINT_URL)
             .buckets.all()
         )
     except Exception as err:
@@ -112,7 +135,9 @@ def check_aws_access(slack_alert_webhook=None) -> List[dict]:
         raise RuntimeError(f"Error in connecting to AWS: {err}") from err
 
 
-def check_buckets_exist(buckets, slack_alert_webhook=None) -> List[dict]:
+def check_buckets_exist(
+    buckets, slack_alert_webhook=None, aws_profile=None
+) -> List[dict]:
     """
     Check that the provided bucket(s) exist and are accessible
 
@@ -146,11 +171,7 @@ def check_buckets_exist(buckets, slack_alert_webhook=None) -> List[dict]:
         try:
             log.debug("Checking %s exists and accessible", bucket)
             valid.append(
-                boto3.Session(
-                    aws_access_key_id=AWS_ACCESS_KEY,
-                    aws_secret_access_key=AWS_SECRET_KEY,
-                    profile_name=AWS_DEFAULT_PROFILE,
-                )
+                _build_boto3_session(aws_profile=aws_profile)
                 .client("s3", endpoint_url=AWS_S3_ENDPOINT_URL)
                 .head_bucket(Bucket=bucket)
             )
@@ -274,7 +295,7 @@ def _submit_to_pool(pool, func, item_input, items, **kwargs) -> dict:
 
 
 def multi_thread_upload(
-    files, bucket, remote_path, threads, parent_path
+    files, bucket, remote_path, threads, parent_path, aws_profile=None
 ) -> Tuple[Dict[str, str], list]:
     """
     Uploads the given set of `files` to S3 on a single CPU core using
@@ -313,11 +334,7 @@ def multi_thread_upload(
     """
     log.info("Uploading %s files with %s threads", len(files), threads)
 
-    session = boto3.session.Session(
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        profile_name=AWS_DEFAULT_PROFILE,
-    )
+    session = _build_boto3_session(aws_profile=aws_profile)
     s3_client = session.client(
         "s3",
         endpoint_url=AWS_S3_ENDPOINT_URL,
@@ -361,7 +378,7 @@ def multi_thread_upload(
 
 
 def multi_core_upload(
-    files, bucket, remote_path, cores, threads, parent_path
+    files, bucket, remote_path, cores, threads, parent_path, aws_profile=None
 ) -> Tuple[Dict[str, str], list]:
     """
     Call the multi_thread_upload on `files` split across n
@@ -411,6 +428,7 @@ def multi_core_upload(
         remote_path=remote_path,
         parent_path=parent_path,
         threads=threads,
+        aws_profile=aws_profile,
     )
 
     for future in as_completed(concurrent_jobs):

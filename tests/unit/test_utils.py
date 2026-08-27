@@ -662,6 +662,44 @@ class TestGetRunsToUpload(unittest.TestCase):
         rmtree(sequencer_output_dir)
 
 
+class TestGetRunDirectoriesProvidedDirectly(unittest.TestCase):
+    def _create_run_dir(self, root_dir):
+        run_dir = os.path.join(root_dir, "16102023_A01295_001_ABC123")
+        os.makedirs(run_dir, exist_ok=True)
+        open(os.path.join(run_dir, "RunInfo.xml"), "w").close()
+        copyfile(
+            os.path.join(TEST_DATA_DIR, "example_samplesheet.csv"),
+            os.path.join(run_dir, "SampleSheet.csv"),
+        )
+        return run_dir
+
+    def test_monitor_mode_accepts_run_directory_itself(self):
+        monitored_root = os.path.join(TEST_DATA_DIR, uuid4().hex)
+        os.makedirs(monitored_root, exist_ok=True)
+        run_dir = self._create_run_dir(monitored_root)
+        open(os.path.join(run_dir, "CopyComplete.txt"), "w").close()
+
+        to_upload, partial_upload = utils.get_runs_to_upload(
+            [run_dir], max_age=96
+        )
+
+        self.assertEqual(to_upload, [run_dir])
+        self.assertEqual(partial_upload, {})
+
+        rmtree(monitored_root)
+
+    def test_live_cbcl_mode_accepts_run_directory_itself(self):
+        monitored_root = os.path.join(TEST_DATA_DIR, uuid4().hex)
+        os.makedirs(monitored_root, exist_ok=True)
+        run_dir = self._create_run_dir(monitored_root)
+
+        live_runs = utils.get_runs_to_live_upload([run_dir])
+
+        self.assertEqual(live_runs, [run_dir])
+
+        rmtree(monitored_root)
+
+
 class TestGetSequencingFileList(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

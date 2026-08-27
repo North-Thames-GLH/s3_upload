@@ -2,6 +2,7 @@
     "max_cores": 2,
     "max_threads": 8,
     "max_age": 96,
+    "aws_profile": "genomics-s3-write",
     "log_level": "INFO",
     "log_dir": "/var/log/s3_upload",
     "slack_log_webhook": "https://hooks.slack.com/services/CHANNEL_ID/SECRET",

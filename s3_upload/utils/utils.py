@@ -355,9 +355,12 @@ def get_runs_to_upload(
             )
             continue
 
-        sub_directories = [
-            f.path for f in scandir(monitored_dir) if f.is_dir()
-        ]
+        if check_is_sequencing_run_dir(monitored_dir):
+            sub_directories = [monitored_dir]
+        else:
+            sub_directories = [
+                f.path for f in scandir(monitored_dir) if f.is_dir()
+            ]
 
         log.debug(
             "directories found in %s: %s",
@@ -469,9 +472,12 @@ def get_runs_to_live_upload(monitor_dirs, sample_pattern=None) -> list:
             )
             continue
 
-        sub_directories = [
-            f.path for f in scandir(monitored_dir) if f.is_dir()
-        ]
+        if check_is_sequencing_run_dir(monitored_dir):
+            sub_directories = [monitored_dir]
+        else:
+            sub_directories = [
+                f.path for f in scandir(monitored_dir) if f.is_dir()
+            ]
 
         for sub_dir in sub_directories:
             if not check_is_sequencing_run_dir(sub_dir):
@@ -688,6 +694,9 @@ def verify_config(config) -> None:
         config.get("live_cbcl_finalize_completed_runs", True), bool
     ):
         errors.append("live_cbcl_finalize_completed_runs must be a boolean")
+
+    if config.get("aws_profile") and not isinstance(config.get("aws_profile"), str):
+        errors.append("aws_profile must be a string")
 
     if config.get("log_level"):
         level = config.get("log_level")

@@ -220,6 +220,7 @@ def monitor_directories_for_upload(config, dry_run) -> None:
         calls everything except the actual upload for testing / debugging
     """
     log.info("Beginning monitoring directories for runs to upload")
+    aws_profile = config.get("aws_profile")
 
     # preferentially use respective log and alert channel webhooks if specified
     log_url = config.get("slack_log_webhook") or config.get(
@@ -235,10 +236,11 @@ def monitor_directories_for_upload(config, dry_run) -> None:
             " no Slack notifications will be sent"
         )
 
-    check_aws_access(slack_alert_webhook=alert_url)
+    check_aws_access(slack_alert_webhook=alert_url, aws_profile=aws_profile)
     check_buckets_exist(
         buckets=set([x["bucket"] for x in config["monitor"]]),
         slack_alert_webhook=alert_url,
+        aws_profile=aws_profile,
     )
 
     cores = config.get("max_cores", cpu_count())
@@ -431,6 +433,7 @@ def monitor_directories_for_live_cbcl_upload(
         optional override for cbcl file age threshold
     """
     log.info("Beginning monitoring directories for live cbcl upload")
+    aws_profile = config.get("aws_profile")
 
     log_url = config.get("slack_log_webhook") or config.get(
         "slack_alert_webhook"
@@ -445,10 +448,11 @@ def monitor_directories_for_live_cbcl_upload(
             " no Slack notifications will be sent"
         )
 
-    check_aws_access(slack_alert_webhook=alert_url)
+    check_aws_access(slack_alert_webhook=alert_url, aws_profile=aws_profile)
     check_buckets_exist(
         buckets=set([x["bucket"] for x in config["monitor"]]),
         slack_alert_webhook=alert_url,
+        aws_profile=aws_profile,
     )
 
     cores = config.get("max_cores", cpu_count())
@@ -556,6 +560,7 @@ def monitor_directories_for_live_cbcl_upload(
             cores=cores,
             threads=threads,
             parent_path=run_config["parent_path"],
+            aws_profile=aws_profile,
         )
 
         makedirs(path.join(log_dir, "uploads"), exist_ok=True)
