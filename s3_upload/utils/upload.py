@@ -51,18 +51,17 @@ def _build_boto3_session(aws_profile=None):
     )
 
 
-def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> List[dict]:
+def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> None:
     """
-    Check authentication with AWS S3 with stored credentials by checking
-    access to all buckets
+    Check that valid AWS credentials / configuration are available.
+
+    This validates that authentication configuration is present (either
+    an AWS profile or access key / secret key environment variables)
+    without requiring s3:ListAllMyBuckets permission. Actual bucket
+    accessibility is verified separately by check_buckets_exist().
 
     slack_alert_webhook : str
         webhook URL for sending alerts to
-
-    Returns
-    -------
-    list
-        list of available S3 bucket details
 
     Raises
     ------
@@ -70,8 +69,6 @@ def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> List[dict]:
         Raised when mutually exclusive AWS environment variables provided
     SystemExit
         Raised when required environment variables not defined
-    RuntimeError
-        Raised when unable to connect to AWS
     """
     log.info("Checking access to AWS")
 
@@ -117,22 +114,6 @@ def check_aws_access(slack_alert_webhook=None, aws_profile=None) -> List[dict]:
             )
         log.error(error_message)
         sys.exit(error_message)
-
-    try:
-        return list(
-            _build_boto3_session(aws_profile=aws_profile).resource(
-                "s3", endpoint_url=AWS_S3_ENDPOINT_URL
-            )
-            .buckets.all()
-        )
-    except Exception as err:
-        if slack_alert_webhook:
-            post_slack_message(
-                url=slack_alert_webhook,
-                message=f"{slack_base_error}\t\t{err}",
-            )
-
-        raise RuntimeError(f"Error in connecting to AWS: {err}") from err
 
 
 def check_buckets_exist(
