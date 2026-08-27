@@ -488,14 +488,20 @@ def get_runs_to_live_upload(monitor_dirs, sample_pattern=None) -> list:
                 continue
 
             samplesheet_contents = read_samplesheet_from_run_directory(sub_dir)
-            if not samplesheet_contents:
-                continue
 
-            if sample_pattern and not check_all_uploadable_samples(
-                samplesheet_contents=samplesheet_contents,
-                sample_pattern=sample_pattern,
-            ):
-                continue
+            if sample_pattern:
+                if not samplesheet_contents:
+                    log.warning(
+                        "sample_regex specified but no samplesheet found in"
+                        " %s, run will be skipped",
+                        sub_dir,
+                    )
+                    continue
+                if not check_all_uploadable_samples(
+                    samplesheet_contents=samplesheet_contents,
+                    sample_pattern=sample_pattern,
+                ):
+                    continue
 
             live_runs.append(sub_dir)
 
