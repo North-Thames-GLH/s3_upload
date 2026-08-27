@@ -9,9 +9,9 @@
     "monitor": [
         {
             "monitored_directories": [
-                "/data/rds/DMP/DUDMP/TRANSGEN/sedlawrence/1.runs"
+                "/mnt/smb/RDS2/transgen-mdx/1.runs/260731_NB501821_0986_AHLWC5BGY2"
             ],
-            "bucket": "nt-glh-2",
+            "bucket": "development-bucket-temp",
             "remote_path": "/RMH/training/",
             "live_cbcl": true
         }

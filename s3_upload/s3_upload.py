@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
     subparsers = parser.add_subparsers(
-        help="Upload mode to run", dest="mode", required=True
+        help="Upload mode to run", dest="mode"
     )
 
     monitor_parser = subparsers.add_parser(
@@ -149,7 +149,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.mode is None:
+        parser.error("the following arguments are required: mode")
+
+    return args
 
 
 def upload_single_run(args) -> None:
