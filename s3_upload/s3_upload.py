@@ -367,6 +367,7 @@ def monitor_directories_for_upload(config, dry_run) -> None:
             cores=cores,
             threads=threads,
             parent_path=run_config["parent_path"],
+            aws_profile=aws_profile,
         )
 
         # set output logs to go into subdirectory with stdout/stderr log
