@@ -230,6 +230,100 @@ def check_buckets_exist(
     return valid
 
 
+def derive_remote_key(local_file, parent_path, remote_path) -> str:
+    """
+    Derive the S3 key for a local file by stripping the parent path and
+    joining it under the remote path.
+
+    This is the single source of truth for how local file paths are
+    transformed into S3 keys, shared by upload_single_file and the sync
+    mode's missing-file computation so that keys line up byte-for-byte
+    across modes.
+
+    Parameters
+    ----------
+    local_file : str
+        file and path to derive the key for
+    parent_path : str
+        path to parent of sequencing directory, removed from the file
+        path so it does not form part of the remote key
+    remote_path : str
+        parent directory in bucket to upload to
+
+    Returns
+    -------
+    str
+        the S3 key the local file would occupy under the remote path
+    """
+    key = re.sub(rf"^{parent_path}", "", local_file).lstrip("/")
+    key = path.join(remote_path, key).lstrip("/")
+
+    return key
+
+
+def list_remote_objects(bucket, prefix, aws_profile=None) -> Dict[str, int]:
+    """
+    List all S3 objects under the given prefix, returning a mapping of
+    object key to object size in bytes.
+
+    All paginated responses are aggregated so that the returned mapping
+    is complete. Object sizes are read directly from the listing, so no
+    per-object metadata request is required for size verification.
+
+    This requires only s3:ListBucket permission and does not fall back
+    to any local state log; any failure is treated as fatal.
+
+    Parameters
+    ----------
+    bucket : str
+        S3 bucket to list objects from
+    prefix : str
+        S3 key prefix to list objects under
+    aws_profile : str | None
+        Optional AWS profile name to use for authentication
+
+    Returns
+    -------
+    dict
+        mapping of S3 object key to object size in bytes
+
+    Raises
+    ------
+    RuntimeError
+        Raised when listing objects under the prefix fails
+    """
+    log.info("Listing remote objects under %s:%s", bucket, prefix)
+
+    try:
+        client = _build_boto3_session(aws_profile=aws_profile).client(
+            "s3", endpoint_url=AWS_S3_ENDPOINT_URL
+        )
+
+        remote_objects = {}
+
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for remote_object in page.get("Contents", []):
+                remote_objects[remote_object["Key"]] = remote_object["Size"]
+    except Exception as exc:
+        error_message = (
+            "Failed to list remote objects under prefix {}: {}".format(
+                prefix, exc
+            )
+        )
+        log.error(error_message)
+        raise RuntimeError(error_message)
+
+    log.info(
+        "Found %s remote objects under %s:%s",
+        len(remote_objects),
+        bucket,
+        prefix,
+    )
+
+    return remote_objects
+
+
 def upload_single_file(
     s3_client, bucket, remote_path, local_file, parent_path
 ) -> Tuple[str, str]:
@@ -258,8 +352,11 @@ def upload_single_file(
         ETag attribute of the uploaded file
     """
     # remove base directory and join to specified S3 location
-    upload_file = re.sub(rf"^{parent_path}", "", local_file).lstrip("/")
-    upload_file = path.join(remote_path, upload_file).lstrip("/")
+    upload_file = derive_remote_key(
+        local_file=local_file,
+        parent_path=parent_path,
+        remote_path=remote_path,
+    )
 
     log.debug("Uploading %s to %s:%s", local_file, bucket, upload_file)
 

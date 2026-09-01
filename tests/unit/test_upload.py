@@ -683,3 +683,240 @@ class TestMultiCoreUpload(unittest.TestCase):
             self.assertEqual(
                 (uploaded_files, failed_files), ({}, self.local_files)
             )
+
+
+@patch("s3_upload.utils.upload._build_boto3_session")
+class TestListRemoteObjects(unittest.TestCase):
+    """
+    Tests for upload.list_remote_objects which lists all S3 objects under
+    a given prefix, aggregating paginated responses into a single
+    key -> size mapping. Failures are re-raised as RuntimeError with no
+    partial map returned.
+    """
+
+    def _build_paginator_mock(self, mock_session, pages):
+        """
+        Configure the mocked boto3 session so that
+        _build_boto3_session(...).client(...).get_paginator(...).paginate(...)
+        yields the provided list of pages.
+        """
+        mock_client = Mock()
+        mock_session.return_value.client.return_value = mock_client
+
+        mock_paginator = Mock()
+        mock_client.get_paginator.return_value = mock_paginator
+        mock_paginator.paginate.return_value = iter(pages)
+
+        return mock_client, mock_paginator
+
+    def test_multi_page_results_fully_aggregated_into_key_size_map(
+        self, mock_session
+    ):
+        """
+        Requirement 3.2: all objects across every paginated response are
+        aggregated so that no object is dropped at a page boundary.
+        """
+        pages = [
+            {
+                "Contents": [
+                    {"Key": "run1/file_1.txt", "Size": 10},
+                    {"Key": "run1/file_2.txt", "Size": 20},
+                ]
+            },
+            {
+                "Contents": [
+                    {"Key": "run1/file_3.txt", "Size": 30},
+                    {"Key": "run1/file_4.txt", "Size": 40},
+                ]
+            },
+            {
+                "Contents": [
+                    {"Key": "run1/file_5.txt", "Size": 50},
+                ]
+            },
+        ]
+
+        self._build_paginator_mock(mock_session, pages)
+
+        remote_objects = upload.list_remote_objects(
+            bucket="test_bucket", prefix="run1"
+        )
+
+        expected = {
+            "run1/file_1.txt": 10,
+            "run1/file_2.txt": 20,
+            "run1/file_3.txt": 30,
+            "run1/file_4.txt": 40,
+            "run1/file_5.txt": 50,
+        }
+
+        with self.subTest("all keys across all pages present"):
+            self.assertEqual(remote_objects, expected)
+
+        with self.subTest("no object dropped at page boundary"):
+            self.assertEqual(len(remote_objects), 5)
+
+    def test_paginate_called_with_bucket_and_prefix(self, mock_session):
+        mock_client, mock_paginator = self._build_paginator_mock(
+            mock_session, [{"Contents": []}]
+        )
+
+        upload.list_remote_objects(bucket="test_bucket", prefix="run1")
+
+        with self.subTest("correct paginator requested"):
+            self.assertEqual(
+                mock_client.get_paginator.call_args[0][0], "list_objects_v2"
+            )
+
+        with self.subTest("bucket and prefix passed to paginate"):
+            self.assertEqual(
+                mock_paginator.paginate.call_args[1],
+                {"Bucket": "test_bucket", "Prefix": "run1"},
+            )
+
+    def test_empty_prefix_returns_empty_map(self, mock_session):
+        """
+        A prefix with no objects (page with no Contents key) yields an
+        empty map rather than raising.
+        """
+        self._build_paginator_mock(mock_session, [{}])
+
+        remote_objects = upload.list_remote_objects(
+            bucket="test_bucket", prefix="run1"
+        )
+
+        self.assertEqual(remote_objects, {})
+
+    def test_runtime_error_raised_on_client_error(self, mock_session):
+        """
+        Requirement 3.4: a client error while listing raises RuntimeError
+        and does not return a partial map (no fallback).
+        """
+        mock_client = Mock()
+        mock_session.return_value.client.return_value = mock_client
+        mock_client.get_paginator.side_effect = s3_exceptions.ClientError(
+            {"Error": {"Code": 1, "Message": "list failed"}}, "ListObjectsV2"
+        )
+
+        with self.subTest("RuntimeError raised with prefix in message"):
+            with pytest.raises(RuntimeError, match=re.escape("run1")):
+                upload.list_remote_objects(
+                    bucket="test_bucket", prefix="run1"
+                )
+
+    def test_runtime_error_raised_on_pagination_error_no_partial_map(
+        self, mock_session
+    ):
+        """
+        Requirement 3.4: if the error is raised partway through iterating
+        the paginated responses, list_remote_objects raises RuntimeError
+        and does not return a partially aggregated map.
+        """
+        mock_client = Mock()
+        mock_session.return_value.client.return_value = mock_client
+
+        mock_paginator = Mock()
+        mock_client.get_paginator.return_value = mock_paginator
+
+        def failing_pages():
+            yield {
+                "Contents": [
+                    {"Key": "run1/file_1.txt", "Size": 10},
+                ]
+            }
+            raise s3_exceptions.ClientError(
+                {"Error": {"Code": 1, "Message": "page failed"}},
+                "ListObjectsV2",
+            )
+
+        mock_paginator.paginate.return_value = failing_pages()
+
+        with pytest.raises(RuntimeError, match=re.escape("run1")):
+            upload.list_remote_objects(bucket="test_bucket", prefix="run1")
+
+
+class TestDeriveRemoteKey(unittest.TestCase):
+    """
+    Tests for the shared S3 key derivation helper. The key it produces
+    must line up byte-for-byte with the key upload_single_file uploads
+    a file to, for all path shapes (nested remote_path and root
+    remote_path).
+    """
+
+    # each case covers a different remote_path shape, including a nested
+    # remote path and the root ("/") remote path
+    key_cases = [
+        {
+            "remote_path": "/bucket_dir1/",
+            "local_file": "/path/to/monitored_dir/run1/Samplesheet.csv",
+            "parent_path": "/path/to/monitored_dir/",
+            "expected_key": "bucket_dir1/run1/Samplesheet.csv",
+        },
+        {
+            "remote_path": "/bucket_dir_1/bucket_dir_2",
+            "local_file": (
+                "/path/to/monitored_dir/run1/Data/Intensities/L001_1.cbcl"
+            ),
+            "parent_path": "/path/to/monitored_dir/",
+            "expected_key": (
+                "bucket_dir_1/bucket_dir_2/run1/Data/Intensities/L001_1.cbcl"
+            ),
+        },
+        {
+            "remote_path": "/",
+            "local_file": "/one_level_parent/run1/Samplesheet.csv",
+            "parent_path": "/one_level_parent/",
+            "expected_key": "run1/Samplesheet.csv",
+        },
+        {
+            "remote_path": "/",
+            "local_file": (
+                "/one_level_parent/run1/Data/Intensities/BaseCalls/L001_2.cbcl"
+            ),
+            "parent_path": "/one_level_parent/",
+            "expected_key": (
+                "run1/Data/Intensities/BaseCalls/L001_2.cbcl"
+            ),
+        },
+    ]
+
+    def test_expected_key_returned_for_nested_and_root_remote_paths(self):
+        for case in self.key_cases:
+            with self.subTest(case["expected_key"]):
+                derived_key = upload.derive_remote_key(
+                    local_file=case["local_file"],
+                    parent_path=case["parent_path"],
+                    remote_path=case["remote_path"],
+                )
+
+                self.assertEqual(derived_key, case["expected_key"])
+
+    @patch("s3_upload.utils.upload.boto3.session.Session.client")
+    def test_derived_key_matches_upload_single_file_key(self, mock_client):
+        """
+        The key derive_remote_key produces for a local file must equal
+        the key upload_single_file actually uploads it to, so that sync
+        mode's reconciliation keys line up with what the other modes
+        wrote (Property 4 / Requirement 7.2).
+        """
+        for case in self.key_cases:
+            with self.subTest(case["expected_key"]):
+                upload.upload_single_file(
+                    s3_client=boto3.client(),
+                    bucket="test_bucket",
+                    remote_path=case["remote_path"],
+                    local_file=case["local_file"],
+                    parent_path=case["parent_path"],
+                )
+
+                upload_single_file_key = (
+                    mock_client.return_value.upload_file.call_args[1]["Key"]
+                )
+
+                derived_key = upload.derive_remote_key(
+                    local_file=case["local_file"],
+                    parent_path=case["parent_path"],
+                    remote_path=case["remote_path"],
+                )
+
+                self.assertEqual(derived_key, upload_single_file_key)

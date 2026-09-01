@@ -1112,3 +1112,169 @@ class TestSizeofFmt(unittest.TestCase):
         for byte in bytes_to_formatted:
             with self.subTest():
                 self.assertEqual(utils.sizeof_fmt(byte[0]), byte[1])
+
+
+class TestComputeMissingFiles(unittest.TestCase):
+    """
+    Tests for the missing-file diff used by sync mode. S3 is treated as
+    the source of truth: a local file counts as already uploaded only
+    when its derived key is present AND its local byte size matches the
+    remote object size. No local state log is consulted.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """
+        Create a small run directory with files of known byte sizes so
+        that compute_missing_files' os.stat size check runs against real
+        files, following the f.truncate(size) convention used elsewhere.
+        """
+        cls.parent_path = os.path.join(TEST_DATA_DIR, uuid4().hex)
+        cls.run_dir = os.path.join(cls.parent_path, "run1")
+
+        # relative path -> byte size, covering a root-level file and a
+        # nested cbcl file
+        cls.local_files_and_sizes = {
+            "SampleSheet.csv": 100,
+            "Data/Intensities/BaseCalls/L001/C1.1/L001_1.cbcl": 5000,
+        }
+
+        cls.local_files = []
+        for rel_path, size in cls.local_files_and_sizes.items():
+            full_path = os.path.join(cls.run_dir, rel_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "wb") as f:
+                f.truncate(size)
+            cls.local_files.append(full_path)
+
+        cls.remote_path = "/bucket_dir1/"
+
+        # the S3 keys these local files would occupy, derived via the
+        # single source of truth helper so the diff keys line up
+        cls.keys = {
+            f: utils.derive_remote_key(
+                local_file=f,
+                parent_path=cls.parent_path,
+                remote_path=cls.remote_path,
+            )
+            for f in cls.local_files
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        rmtree(cls.parent_path)
+
+    def _remote_all_present(self):
+        """Remote listing where every local file is present with matching size"""
+        return {
+            self.keys[f]: self.local_files_and_sizes[
+                os.path.relpath(f, self.run_dir)
+            ]
+            for f in self.local_files
+        }
+
+    def test_file_included_when_key_absent_from_remote(self):
+        """key absent => file is missing (Requirement 4.1)"""
+        # start from a fully-present listing then drop one key
+        remote = self._remote_all_present()
+        absent_file = self.local_files[0]
+        del remote[self.keys[absent_file]]
+
+        missing = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects=remote,
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        self.assertEqual(missing, [absent_file])
+
+    def test_file_included_when_key_present_but_size_differs(self):
+        """key present + size mismatch => file is missing (Requirement 4.2)"""
+        remote = self._remote_all_present()
+        mismatched_file = self.local_files[1]
+        # set the remote size to something other than the local size
+        remote[self.keys[mismatched_file]] = (
+            self.local_files_and_sizes[
+                os.path.relpath(mismatched_file, self.run_dir)
+            ]
+            + 1
+        )
+
+        missing = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects=remote,
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        self.assertEqual(missing, [mismatched_file])
+
+    def test_file_excluded_when_key_present_and_size_equal(self):
+        """key present + size equal => file already uploaded (Requirement 4.3)"""
+        remote = self._remote_all_present()
+
+        missing = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects=remote,
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        self.assertEqual(missing, [])
+
+    def test_all_files_included_when_remote_is_empty(self):
+        """empty remote + non-empty local => all missing (Requirement 3.5)"""
+        missing = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects={},
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        self.assertEqual(sorted(missing), sorted(self.local_files))
+
+    def test_diff_is_independent_of_state_log_entries_in_remote_map(self):
+        """
+        The missing set is a pure function of the local files and the
+        live remote listing; it must be identical whether or not entries
+        resembling state-log files (.upload.log.json / .sync.log.json /
+        .live_cbcl.upload.log.json) exist in the remote object map
+        (Property 3 / Requirement 3.3).
+        """
+        # remote listing where one file is present and one is absent
+        remote_without_logs = self._remote_all_present()
+        absent_file = self.local_files[0]
+        del remote_without_logs[self.keys[absent_file]]
+
+        # same listing but polluted with state-log-like keys that must
+        # not influence the diff (none of them are derived local keys)
+        run_id = os.path.basename(self.run_dir)
+        remote_with_logs = dict(remote_without_logs)
+        remote_with_logs.update(
+            {
+                "bucket_dir1/{}.upload.log.json".format(run_id): 12,
+                "bucket_dir1/{}.sync.log.json".format(run_id): 34,
+                "bucket_dir1/{}.live_cbcl.upload.log.json".format(run_id): 56,
+            }
+        )
+
+        missing_without_logs = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects=remote_without_logs,
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        missing_with_logs = utils.compute_missing_files(
+            local_files=self.local_files,
+            remote_objects=remote_with_logs,
+            parent_path=self.parent_path,
+            remote_path=self.remote_path,
+        )
+
+        with self.subTest("diff unaffected by state-log entries"):
+            self.assertEqual(missing_without_logs, missing_with_logs)
+
+        with self.subTest("diff still reflects the genuinely missing file"):
+            self.assertEqual(missing_with_logs, [absent_file])

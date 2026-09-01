@@ -10,6 +10,7 @@ from typing import List, Tuple, Union
 
 from .io import read_upload_state_log, read_samplesheet_from_run_directory
 from .log import get_logger
+from .upload import derive_remote_key
 
 log = get_logger("s3_upload")
 
@@ -635,6 +636,66 @@ def filter_uploaded_files(local_files, uploaded_files) -> list:
     log.debug("%s local files left to upload", len(uploadable_files))
 
     return uploadable_files
+
+
+def compute_missing_files(
+    local_files, remote_objects, parent_path, remote_path
+) -> list:
+    """
+    Compute the subset of local files that are missing from S3.
+
+    S3 is treated as the source of truth. A local file is considered
+    already uploaded only when its derived S3 key is present in the
+    remote object listing AND its local byte size matches the remote
+    object size; otherwise it is included in the returned set. No local
+    state log is consulted, so the result depends solely on the local
+    files and the live remote listing.
+
+    Parameters
+    ----------
+    local_files : list
+        list of absolute local file paths to reconcile
+    remote_objects : dict
+        mapping of S3 key to object size in bytes for objects already
+        present under the run prefix
+    parent_path : str
+        path to parent of sequencing directory, stripped from the local
+        path to form the S3 key
+    remote_path : str
+        parent directory in bucket, prepended to form the S3 key
+
+    Returns
+    -------
+    list
+        list of absolute local file paths whose S3 key is absent, or
+        present with a differing size, ready to feed straight into
+        split_file_list_by_cores / multi_core_upload
+    """
+    missing = []
+
+    for local_file in local_files:
+        key = derive_remote_key(
+            local_file=local_file,
+            parent_path=parent_path,
+            remote_path=remote_path,
+        )
+        remote_size = remote_objects.get(key)
+
+        if remote_size is None:
+            # key absent from S3 => not yet uploaded
+            missing.append(local_file)
+        elif stat(local_file).st_size != remote_size:
+            # key present but sizes differ => partial / truncated object
+            missing.append(local_file)
+        # else key present and size matches => already uploaded, skip
+
+    log.info(
+        "%s of %s local files missing from S3",
+        len(missing),
+        len(local_files),
+    )
+
+    return missing
 
 
 def split_file_list_by_cores(files, n) -> List[List[str]]:

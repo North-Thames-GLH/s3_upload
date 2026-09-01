@@ -427,3 +427,96 @@ def write_live_upload_state_to_log(
         json.dump(log_data, fh, indent=4)
 
     return log_data
+
+
+def write_sync_state_to_log(
+    run_id,
+    run_path,
+    log_file,
+    total_local,
+    total_remote,
+    uploaded_files,
+    failed_files,
+    passes,
+) -> dict:
+    """
+    Write the state log for a `sync` mode run.
+
+    This log is written to `{log_dir}/uploads/{run_id}.sync.log.json`, a
+    filename deliberately distinct from the `.upload.log.json` and
+    `.live_cbcl.upload.log.json` state logs written by the `monitor` and
+    `live_cbcl` modes. It is informational only: `sync` mode determines
+    what to upload solely by reconciling local files against the live S3
+    listing and never reads this file back to decide what to upload.
+
+    Log file will have the following structure:
+
+    {
+        "run_id": run_id,               -> ID of sequencing run
+        "run_path": run_path,           -> full local path to the run dir
+        "updated_at": ,                 -> ISO8601 UTC timestamp of write
+        "passes": ,                     -> number of reconciliation passes run
+        "total_local_files": ,          -> total count of local files
+        "total_remote_objects": ,       -> total objects under the run prefix
+        "total_uploaded_files": ,       -> total files uploaded this sync
+        "total_failed_upload": ,        -> total files that failed to upload
+        "failed_upload_files": [],      -> list of files that failed to upload
+    }
+
+    Parameters
+    ----------
+    run_id : str
+        ID of sequencing run
+    run_path : str
+        path to run directory being synced
+    log_file : str
+        file to write log to (expected to be
+        `{log_dir}/uploads/{run_id}.sync.log.json`)
+    total_local : int
+        total count of local files discovered in the run directory
+    total_remote : int
+        total count of objects listed under the run prefix in S3
+    uploaded_files : dict
+        mapping of uploaded local file path to remote object ID
+    failed_files : list
+        list of files that failed to upload
+    passes : int
+        number of reconciliation passes performed
+
+    Returns
+    -------
+    dict
+        all sync state log data for the run
+    """
+    total_uploaded_files = len(uploaded_files.keys())
+    total_failed_upload = len(failed_files)
+
+    log.info("logging sync state of %s", run_id)
+    log.info(
+        "total local files: %s | total remote objects: %s | total uploaded"
+        " files: %s | total failed upload: %s | passes: %s",
+        total_local,
+        total_remote,
+        total_uploaded_files,
+        total_failed_upload,
+        passes,
+    )
+
+    log_data = {
+        "run_id": run_id,
+        "run_path": run_path,
+        "updated_at": "{}Z".format(datetime.utcnow().isoformat()),
+        "passes": passes,
+        "total_local_files": total_local,
+        "total_remote_objects": total_remote,
+        "total_uploaded_files": total_uploaded_files,
+        "total_failed_upload": total_failed_upload,
+        "failed_upload_files": failed_files,
+    }
+
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    with open(log_file, "w") as fh:
+        json.dump(log_data, fh, indent=4)
+
+    return log_data

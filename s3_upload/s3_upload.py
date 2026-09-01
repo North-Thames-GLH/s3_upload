@@ -2,6 +2,7 @@ import argparse
 from os import cpu_count, makedirs, path
 from pathlib import Path
 import sys
+import time
 from timeit import default_timer as timer
 
 from utils.io import (
@@ -9,16 +10,19 @@ from utils.io import (
     read_config,
     read_live_upload_state_log,
     write_live_upload_state_to_log,
+    write_sync_state_to_log,
     write_upload_state_to_log,
 )
 from utils.upload import (
     check_aws_access,
     check_buckets_exist,
+    list_remote_objects,
     multi_core_upload,
 )
 from utils.utils import (
     check_is_sequencing_run_dir,
     check_termination_file_exists,
+    compute_missing_files,
     get_live_cbcl_files,
     get_runs_to_live_upload,
     get_runs_to_upload,
@@ -149,6 +153,83 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help=(
+            "Reconcile a local run directory against S3 and upload only"
+            " missing / size-mismatched files"
+        ),
+    )
+    sync_parser.add_argument(
+        "--local_path",
+        required=True,
+        help="path to run directory to sync",
+    )
+    sync_parser.add_argument(
+        "--bucket",
+        required=True,
+        type=str,
+        help="S3 bucket to sync to",
+    )
+    sync_parser.add_argument(
+        "--remote_path",
+        default="/",
+        help="Remote parent path in bucket to sync sequencing dir to",
+    )
+    sync_parser.add_argument(
+        "--aws_profile",
+        default=None,
+        help="AWS profile to use for authentication",
+    )
+    sync_parser.add_argument(
+        "--cores",
+        required=False,
+        type=int,
+        default=cpu_count(),
+        help=(
+            "Number of CPU cores to split total files to upload across, will "
+            "default to using all available"
+        ),
+    )
+    sync_parser.add_argument(
+        "--threads",
+        type=int,
+        default=8,
+        help=(
+            "Number of threads to open per core to split uploading across "
+            "(default: 8)"
+        ),
+    )
+    sync_parser.add_argument(
+        "--max_passes",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of reconciliation passes to attempt before"
+            " giving up (default: 10)"
+        ),
+    )
+    sync_parser.add_argument(
+        "--backoff_seconds",
+        type=int,
+        default=60,
+        help=(
+            "Seconds to wait between reconciliation passes that make no"
+            " progress (default: 60)"
+        ),
+    )
+    sync_parser.add_argument(
+        "--log_dir",
+        default="/var/log/s3_upload",
+        help="Directory to write the sync state log to",
+    )
+    sync_parser.add_argument(
+        "--dry_run",
+        default=False,
+        action="store_true",
+        help="Report missing files that would be uploaded without uploading",
+    )
+
     args = parser.parse_args()
 
     if args.mode is None:
@@ -211,6 +292,139 @@ def upload_single_run(args) -> None:
         args.local_path,
         f"{int(total // 60)}m {int(total % 60)}s",
     )
+
+
+def sync_single_run(args) -> None:
+    """
+    Reconcile a single local run directory against its S3 prefix and
+    upload only the files that are missing or size-mismatched.
+
+    S3 is treated as the source of truth: on each pass the remote prefix
+    is re-listed, the missing set is recomputed against the (fixed) local
+    file list, and only the missing files are uploaded. The pass is
+    repeated until the run is fully synced or `max_passes` is reached.
+    Credentials are re-resolved each pass (via `multi_core_upload` /
+    `list_remote_objects`) so a sync exceeding the credential lifetime can
+    complete across passes.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        parsed command line arguments
+    """
+    aws_profile = args.aws_profile
+    run_dir = args.local_path
+
+    check_aws_access(aws_profile=aws_profile)
+    check_buckets_exist(buckets=[args.bucket], aws_profile=aws_profile)
+
+    if not Path(run_dir).exists():
+        log.error("Run directory does not exist: %s", run_dir)
+        sys.exit(1)
+
+    # pass through the parent of the specified directory so the run
+    # directory name forms the leaf of the remote key, matching how the
+    # other modes upload
+    parent_path = Path(run_dir).parent
+
+    # local run directory is stable during a sync, so enumerate once
+    local_files = get_sequencing_file_list(run_dir)
+    run_id = Path(run_dir).name
+    run_prefix = path.join(args.remote_path, run_id).lstrip("/")
+
+    log_file = path.join(
+        args.log_dir, "uploads", "{}.sync.log.json".format(run_id)
+    )
+
+    # cumulative counts across passes for the sync state log
+    cumulative_uploaded = {}
+    cumulative_failed = []
+    missing = []
+
+    for attempt in range(1, args.max_passes + 1):
+        # re-list remote objects each pass since previous passes change
+        # what exists in S3; raises RuntimeError on failure (no fallback)
+        remote = list_remote_objects(args.bucket, run_prefix, aws_profile)
+        missing = compute_missing_files(
+            local_files=local_files,
+            remote_objects=remote,
+            parent_path=parent_path,
+            remote_path=args.remote_path,
+        )
+
+        log.info(
+            "Pass %s: %s local, %s remote, %s missing",
+            attempt,
+            len(local_files),
+            len(remote),
+            len(missing),
+        )
+
+        if not missing:
+            log.info("Run %s fully synced", run_id)
+            return
+
+        if args.dry_run:
+            for f in missing:
+                log.info("Would upload %s", f)
+            log.info(
+                "--dry_run specified, %s files would be uploaded for %s,"
+                " exiting without uploading",
+                len(missing),
+                run_id,
+            )
+            return
+
+        split = split_file_list_by_cores(files=missing, n=args.cores)
+
+        uploaded, failed = multi_core_upload(
+            files=split,
+            bucket=args.bucket,
+            remote_path=args.remote_path,
+            cores=args.cores,
+            threads=args.threads,
+            parent_path=parent_path,
+            aws_profile=aws_profile,
+        )
+
+        cumulative_uploaded = {**cumulative_uploaded, **uploaded}
+        cumulative_failed = failed
+
+        log.info(
+            "Pass %s: uploaded %s files, %s failed",
+            attempt,
+            len(uploaded),
+            len(failed),
+        )
+
+        write_sync_state_to_log(
+            run_id=run_id,
+            run_path=run_dir,
+            log_file=log_file,
+            total_local=len(local_files),
+            total_remote=len(remote),
+            uploaded_files=cumulative_uploaded,
+            failed_files=cumulative_failed,
+            passes=attempt,
+        )
+
+        if not uploaded:
+            # no progress this pass (e.g. all uploads failed / expired
+            # credentials) => back off before re-resolving and retrying
+            log.warning(
+                "No progress on pass %s, backing off %ss",
+                attempt,
+                args.backoff_seconds,
+            )
+            time.sleep(args.backoff_seconds)
+
+    # exhausted all passes with work still remaining
+    log.error(
+        "Reached max passes (%s) with %s files still missing",
+        args.max_passes,
+        len(missing),
+    )
+    sys.exit(1)
 
 
 def monitor_directories_for_upload(config, dry_run) -> None:
@@ -638,6 +852,8 @@ def main() -> None:
 
     if args.mode == "upload":
         upload_single_run(args)
+    elif args.mode == "sync":
+        sync_single_run(args)
     else:
         config = read_config(config=args.config)
         verify_config(config=config)
