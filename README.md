@@ -9,6 +9,8 @@ There are 2 modes implemented, one to interactively upload a single sequencing r
 
 A third mode `live_cbcl` is also implemented to monitor in-progress sequencing runs and upload `.cbcl` files from closed cycle directories while the run is still active.
 
+A fourth mode `sync` is implemented as a recovery path that treats S3 as the source of truth. Rather than relying on local state logs, it lists what is already present under the run's S3 prefix, compares it against the local run directory, and uploads only the files that are missing or whose byte size does not match S3. This is useful when a local state log is lost, stale, or split across the `monitor` and `live_cbcl` log files, allowing a partially uploaded run to be completed without re-uploading everything.
+
 All behaviour for the monitor mode is controlled by a JSON config file (described [below](https://github.com/eastgenomics/s3_upload?tab=readme-ov-file#config)). It is intended to be set up to run on a schedule and monitor one or more directories for newly completed sequencing runs and automatically upload to specified AWS S3 bucket(s) and remote path(s). Multiple local and remote paths may be specified to monitor the output of multiple sequencers. Runs to upload may currently be filtered with regex patterns to match against the samples parsed from the samplesheet, where the sample names are informative of the assay / experiment to be uploaded.
 
 ## :desktop_computer: Usage
@@ -30,6 +32,33 @@ Adding to a crontab for live cbcl transfer every 5 minutes:
 */5 * * * * python3 s3_upload/s3_upload.py live_cbcl --config /path/to/config.json
 ```
 
+Recovering a partially uploaded run with `sync` (reconciles the local run directory against S3 and uploads only missing / size-mismatched files):
+```
+python3 s3_upload/s3_upload.py sync \
+    --local_path /mnt/smb/RDS2/transgen-mdx/1.runs/20260827_LH00575_0330_A23KWJJLT3 \
+    --bucket development-bucket-input \
+    --remote_path 1.runs/ \
+    --aws_profile genomics-s3-write \
+    --log_dir /tmp/s3_upload_logs \
+    --cores 1 \
+    --threads 4
+```
+
+Doing a dry run first to report what would be uploaded without uploading anything:
+```
+python3 s3_upload/s3_upload.py sync \
+    --local_path /mnt/smb/RDS2/transgen-mdx/1.runs/20260827_LH00575_0330_A23KWJJLT3 \
+    --bucket development-bucket-input \
+    --remote_path 1.runs/ \
+    --aws_profile genomics-s3-write \
+    --log_dir /tmp/s3_upload_logs \
+    --cores 1 \
+    --threads 4 \
+    --dry_run
+```
+
+The above uploads the run to `s3://development-bucket-input/1.runs/20260827_LH00575_0330_A23KWJJLT3/...` (the run directory name becomes the leaf of the remote prefix, matching where `monitor` / `live_cbcl` upload it), and writes a sync state log to `/tmp/s3_upload_logs/uploads/20260827_LH00575_0330_A23KWJJLT3.sync.log.json`.
+
 
 ## :page_facing_up: Inputs
 
@@ -50,6 +79,21 @@ Available inputs for `live_cbcl`:
 * `--config`: path to JSON config file for monitoring (see Config section below)
 * `--dry_run` (optional): calls everything except the actual upload to check what `.cbcl` files would be uploaded
 * `--grace_seconds` (optional): override minimum age in seconds for `.cbcl` files to be considered stable for upload
+
+
+Available inputs for `sync`:
+* `--local_path` (required): path to the run directory to reconcile against S3
+* `--bucket` (required): existing S3 bucket with write permission for authenticated user
+* `--remote_path` (optional | default: `/`): parent path in the bucket where the run lives (the run directory name is appended to form the prefix)
+* `--aws_profile` (optional | default: none): AWS profile name to use with boto3 (e.g. `genomics-s3-write`); alternatively set `AWS_ACCESS_KEY` / `AWS_SECRET_KEY` environment variables
+* `--cores` (optional | default: maximum available): total CPU cores to split uploading of files across
+* `--threads` (optional | default: 8): total threads to use per CPU core for uploading
+* `--max_passes` (optional | default: 10): maximum number of reconcile-and-upload passes before giving up with a non-zero exit
+* `--backoff_seconds` (optional | default: 60): seconds to wait between passes that make no progress
+* `--log_dir` (optional | default: `/var/log/s3_upload`): directory to write the sync state log to (`{run_id}.sync.log.json`)
+* `--dry_run` (optional): report the missing file set and exit without uploading or entering the retry loop
+
+Unlike `monitor` / `live_cbcl`, `sync` takes CLI arguments rather than a JSON config file, and does not read any local state log to decide what to upload. A local file counts as already uploaded only when its S3 key exists **and** its byte size matches the S3 object, so truncated or partial objects are detected and re-uploaded. Each pass re-resolves AWS credentials, so a sync that runs longer than the credential lifetime can complete across multiple passes. `sync` exits `0` once the run is fully present in S3, and non-zero if `--max_passes` is reached with files still missing.
 
 
 ## :gear: Config
@@ -228,6 +272,32 @@ python3 s3_upload/s3_upload.py live_cbcl \
 ```
 
 The example config `example/example_live_cbcl_config.json` can be used as a template and points by default to `/tmp/s3_upload_simulation/runs`.
+
+An example `live_cbcl` config for monitoring a real run directory looks like:
+
+```json
+{
+    "max_cores": 1,
+    "max_threads": 4,
+    "max_age": 2400,
+    "live_cycle_grace_seconds": 30,
+    "aws_profile": "genomics-s3-write",
+    "log_level": "INFO",
+    "log_dir": "/tmp/s3_upload_logs",
+    "monitor": [
+        {
+            "monitored_directories": [
+                "/mnt/smb/RDS2/transgen-mdx/1.runs/20260827_LH00575_0330_A23KWJJLT3"
+            ],
+            "bucket": "development-bucket-input",
+            "remote_path": "1.runs/",
+            "live_cbcl": true
+        }
+    ]
+}
+```
+
+If the state log for this run is later lost or the upload is interrupted, the same run can be recovered with `sync` mode using the CLI equivalents of these config values (`--local_path`, `--bucket`, `--remote_path`, `--aws_profile`, `--log_dir`, `--cores`, `--threads`) as shown in the [Usage](https://github.com/eastgenomics/s3_upload?tab=readme-ov-file#desktop_computer-usage) section above.
 
 If you want to use an AWS CLI profile, set `aws_profile` in the config JSON to the profile name. For example:
 
