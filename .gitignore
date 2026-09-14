@@ -168,3 +168,7 @@ s3_upload_benchmark*.tsv
 .kiro/specs/**/design.md
 .kiro/specs/**/requirements.md
 .kiro/specs/**/tasks.md
+
+# Generated per-pool sbatch scripts, configs and run logs
+upload_logs/*
+!upload_logs/.gitkeep
