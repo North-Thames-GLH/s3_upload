@@ -937,13 +937,20 @@ def main() -> None:
         log.setLevel(getattr(args, "log_level", "INFO"))
 
         if getattr(args, "debug_botocore", False):
-            import boto3
-
-            boto3.set_stream_logging(name="botocore", level=logging.DEBUG)
-            boto3.set_stream_logging(name="boto3", level=logging.DEBUG)
-            boto3.set_stream_logging(
-                name="s3transfer", level=logging.DEBUG
+            # enable wire-level debug logging for the AWS libraries by
+            # attaching a stream handler to their stdlib loggers; done
+            # directly rather than via boto3.set_stream_logging, which is
+            # not available on older boto3 versions
+            botocore_handler = logging.StreamHandler()
+            botocore_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+                )
             )
+            for lib_logger_name in ("botocore", "boto3", "s3transfer"):
+                lib_logger = logging.getLogger(lib_logger_name)
+                lib_logger.setLevel(logging.DEBUG)
+                lib_logger.addHandler(botocore_handler)
 
         sync_single_run(args)
     else:
