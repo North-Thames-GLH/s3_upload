@@ -16,6 +16,7 @@ from utils.io import (
 from utils.upload import (
     check_aws_access,
     check_buckets_exist,
+    ExpiredCredentialsError,
     list_remote_objects,
     multi_core_upload,
 )
@@ -275,14 +276,22 @@ def upload_single_run(args) -> None:
     # simple timer of upload
     start = timer()
 
-    multi_core_upload(
-        files=files,
-        bucket=args.bucket,
-        remote_path=args.remote_path,
-        cores=args.cores,
-        threads=args.threads,
-        parent_path=parent_path,
-    )
+    try:
+        multi_core_upload(
+            files=files,
+            bucket=args.bucket,
+            remote_path=args.remote_path,
+            cores=args.cores,
+            threads=args.threads,
+            parent_path=parent_path,
+        )
+    except ExpiredCredentialsError:
+        log.error(
+            "AWS credentials expired during upload of %s. Re-authenticate"
+            " and rerun to complete the upload.",
+            args.local_path,
+        )
+        sys.exit(1)
 
     end = timer()
     total = end - start
@@ -377,15 +386,29 @@ def sync_single_run(args) -> None:
 
         split = split_file_list_by_cores(files=missing, n=args.cores)
 
-        uploaded, failed = multi_core_upload(
-            files=split,
-            bucket=args.bucket,
-            remote_path=args.remote_path,
-            cores=args.cores,
-            threads=args.threads,
-            parent_path=parent_path,
-            aws_profile=aws_profile,
-        )
+        try:
+            uploaded, failed = multi_core_upload(
+                files=split,
+                bucket=args.bucket,
+                remote_path=args.remote_path,
+                cores=args.cores,
+                threads=args.threads,
+                parent_path=parent_path,
+                aws_profile=aws_profile,
+            )
+        except ExpiredCredentialsError:
+            # credentials expired mid-pass; the upload aborted fast rather
+            # than failing every remaining file. Back off, then loop: the
+            # next pass re-lists remote objects (so anything uploaded
+            # before the abort is skipped) and re-resolves credentials.
+            log.warning(
+                "Pass %s aborted due to expired AWS credentials, backing"
+                " off %ss before retrying with fresh credentials",
+                attempt,
+                args.backoff_seconds,
+            )
+            time.sleep(args.backoff_seconds)
+            continue
 
         cumulative_uploaded = {**cumulative_uploaded, **uploaded}
         cumulative_failed = failed
@@ -574,15 +597,29 @@ def monitor_directories_for_upload(config, dry_run) -> None:
         # files not being uploaded should be returned and will result in
         # upload state log storing the run as not complete, allowing for
         # retries on uploading
-        uploaded_files, failed_upload = multi_core_upload(
-            files=files_to_upload,
-            bucket=run_config["bucket"],
-            remote_path=run_config["remote_path"],
-            cores=cores,
-            threads=threads,
-            parent_path=run_config["parent_path"],
-            aws_profile=aws_profile,
-        )
+        try:
+            uploaded_files, failed_upload = multi_core_upload(
+                files=files_to_upload,
+                bucket=run_config["bucket"],
+                remote_path=run_config["remote_path"],
+                cores=cores,
+                threads=threads,
+                parent_path=run_config["parent_path"],
+                aws_profile=aws_profile,
+            )
+        except ExpiredCredentialsError:
+            # credentials expired mid-upload; stop processing further runs
+            # rather than failing them all with a dead token. The next
+            # scheduled invocation re-resolves credentials and resumes the
+            # partially uploaded run from its state log.
+            log.error(
+                "AWS credentials expired while uploading %s, stopping"
+                " remaining uploads. Rerun to resume with fresh"
+                " credentials.",
+                run_config["run_id"],
+            )
+            runs_failed_upload.append(run_config["run_id"])
+            break
 
         # set output logs to go into subdirectory with stdout/stderr log
         makedirs(path.join(log_dir, "uploads"), exist_ok=True)
@@ -734,6 +771,7 @@ def monitor_directories_for_live_cbcl_upload(
 
         runs_successfully_uploaded = []
         runs_failed_upload = []
+        credentials_expired = False
 
         for idx, run_config in enumerate(runs_to_upload, 1):
             log.info(
@@ -788,15 +826,27 @@ def monitor_directories_for_live_cbcl_upload(
                 continue
 
             files_to_upload = split_file_list_by_cores(files=files_to_upload, n=cores)
-            uploaded_files, failed_upload = multi_core_upload(
-                files=files_to_upload,
-                bucket=run_config["bucket"],
-                remote_path=run_config["remote_path"],
-                cores=cores,
-                threads=threads,
-                parent_path=run_config["parent_path"],
-                aws_profile=aws_profile,
-            )
+            try:
+                uploaded_files, failed_upload = multi_core_upload(
+                    files=files_to_upload,
+                    bucket=run_config["bucket"],
+                    remote_path=run_config["remote_path"],
+                    cores=cores,
+                    threads=threads,
+                    parent_path=run_config["parent_path"],
+                    aws_profile=aws_profile,
+                )
+            except ExpiredCredentialsError:
+                # credentials expired mid-upload; stop processing the rest
+                # of this poll cycle and let the next cycle re-resolve
+                # fresh credentials (multi_core_upload resolves per call).
+                log.warning(
+                    "AWS credentials expired during live cbcl upload of %s,"
+                    " stopping this poll cycle to retry on the next cycle",
+                    run_config["run_id"],
+                )
+                credentials_expired = True
+                break
 
             makedirs(path.join(log_dir, "uploads"), exist_ok=True)
             log_data = write_live_upload_state_to_log(
@@ -833,7 +883,13 @@ def monitor_directories_for_live_cbcl_upload(
         # Finalise completed runs in the same pass so top-level metadata files
         # (e.g. RunInfo.xml/SampleSheet.csv/CopyComplete.txt) are uploaded after
         # run termination without requiring a separate monitor invocation.
-        if config.get("live_cbcl_finalize_completed_runs", True):
+        # Skip finalisation if credentials expired this cycle; it would only
+        # fail the same way. The next poll cycle re-resolves credentials.
+        if credentials_expired:
+            log.info(
+                "Skipping finalisation this cycle due to expired credentials"
+            )
+        elif config.get("live_cbcl_finalize_completed_runs", True):
             log.info(
                 "Checking for completed runs requiring final upload in monitor mode"
             )

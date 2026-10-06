@@ -920,3 +920,155 @@ class TestDeriveRemoteKey(unittest.TestCase):
                 )
 
                 self.assertEqual(derived_key, upload_single_file_key)
+
+
+def _client_error(code):
+    """Build a botocore ClientError carrying the given error code."""
+    return s3_exceptions.ClientError(
+        {"Error": {"Code": code, "Message": "test"}}, "PutObject"
+    )
+
+
+class TestIsExpiredCredentialsError(unittest.TestCase):
+    """
+    Tests for upload.is_expired_credentials_error, which classifies whether
+    an exception represents expired / invalid AWS credentials (for which
+    retrying with the same credentials is pointless).
+    """
+
+    def test_expired_credentials_error_detected(self):
+        self.assertTrue(
+            upload.is_expired_credentials_error(
+                upload.ExpiredCredentialsError("boom")
+            )
+        )
+
+    def test_client_error_with_expired_token_codes_detected(self):
+        for code in [
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "InvalidToken",
+            "RequestExpired",
+            "TokenRefreshRequired",
+        ]:
+            with self.subTest(code):
+                self.assertTrue(
+                    upload.is_expired_credentials_error(_client_error(code))
+                )
+
+    def test_no_credentials_error_detected(self):
+        self.assertTrue(
+            upload.is_expired_credentials_error(
+                s3_exceptions.NoCredentialsError()
+            )
+        )
+
+    def test_unrelated_client_error_not_detected(self):
+        self.assertFalse(
+            upload.is_expired_credentials_error(_client_error("AccessDenied"))
+        )
+
+    def test_unrelated_exception_not_detected(self):
+        self.assertFalse(
+            upload.is_expired_credentials_error(ValueError("nope"))
+        )
+
+
+@patch("s3_upload.utils.upload.as_completed")
+@patch("s3_upload.utils.upload.upload_single_file")
+@patch("s3_upload.utils.upload.boto3.session.Session.client")
+class TestMultiThreadUploadExpiredCredentials(unittest.TestCase):
+    """
+    Tests that multi_thread_upload aborts fast by raising
+    ExpiredCredentialsError when an upload fails due to expired / invalid
+    credentials, rather than appending every remaining file to the failed
+    list.
+    """
+
+    local_files = [
+        "/path/to/monitored_dir/run1/file1.txt",
+        "/path/to/monitored_dir/run1/file2.txt",
+        "/path/to/monitored_dir/run1/file3.txt",
+    ]
+
+    @patch("s3_upload.utils.upload.ThreadPoolExecutor")
+    @patch("s3_upload.utils.upload._submit_to_pool")
+    def test_expired_token_raises_expired_credentials_error(
+        self, mock_submit, mock_pool, mock_client, mock_upload, mock_completed
+    ):
+        submitted_futures = [Future(), Future(), Future()]
+        submitted_futures[0].set_result(
+            ("/path/to/monitored_dir/run1/file1.txt", "abc")
+        )
+        submitted_futures[1].set_exception(_client_error("ExpiredToken"))
+        submitted_futures[2].set_exception(_client_error("ExpiredToken"))
+
+        mock_submit.return_value = {
+            future: input_file
+            for future, input_file in zip(
+                submitted_futures,
+                ["file1.txt", "file2.txt", "file3.txt"],
+            )
+        }
+        mock_completed.return_value = mock_submit.return_value
+
+        with self.assertRaises(upload.ExpiredCredentialsError):
+            upload.multi_thread_upload(
+                files=self.local_files,
+                bucket="test_bucket",
+                remote_path="/",
+                threads=4,
+                parent_path="/path/to/monitored_dir/",
+            )
+
+
+@patch("s3_upload.utils.upload.as_completed")
+@patch("s3_upload.utils.upload._submit_to_pool")
+@patch("s3_upload.utils.upload.ProcessPoolExecutor")
+@patch("s3_upload.utils.upload._resolve_credentials")
+class TestMultiCoreUploadExpiredCredentials(unittest.TestCase):
+    """
+    Tests that multi_core_upload re-raises ExpiredCredentialsError when a
+    child core aborts due to expired credentials, so the calling mode can
+    re-resolve credentials and retry rather than draining every file into
+    the failed list.
+    """
+
+    local_files = [
+        ["/path/to/monitored_dir/run1/file1.txt"],
+        ["/path/to/monitored_dir/run1/file2.txt"],
+    ]
+
+    def test_expired_credentials_error_from_child_is_reraised(
+        self, mock_resolve, mock_pool, mock_submit, mock_completed
+    ):
+        mock_resolve.return_value = {
+            "access_key": "a",
+            "secret_key": "b",
+        }
+
+        submitted_futures = [Future(), Future()]
+        submitted_futures[0].set_result(
+            ({"/path/to/monitored_dir/run1/file1.txt": "abc"}, [])
+        )
+        submitted_futures[1].set_exception(
+            upload.ExpiredCredentialsError("expired")
+        )
+
+        mock_completed.return_value = submitted_futures
+        mock_submit.return_value = {
+            future: input_file
+            for future, input_file in zip(
+                submitted_futures, self.local_files
+            )
+        }
+
+        with self.assertRaises(upload.ExpiredCredentialsError):
+            upload.multi_core_upload(
+                files=self.local_files,
+                bucket="test_bucket",
+                remote_path="/",
+                cores=2,
+                threads=1,
+                parent_path="/path/to/monitored_dir/",
+            )

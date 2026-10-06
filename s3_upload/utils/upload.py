@@ -25,6 +25,71 @@ AWS_S3_ENDPOINT_URL = environ.get("AWS_S3_ENDPOINT_URL")
 
 log = get_logger("s3_upload")
 
+# AWS error codes that indicate the credentials / session token are no
+# longer valid. These are not resolved by retrying the same request; the
+# only remedy is to re-resolve credentials (which, for an auto-refreshing
+# source such as IAM Roles Anywhere, mints a fresh token) and try again.
+EXPIRED_CREDENTIAL_ERROR_CODES = {
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidToken",
+    "RequestExpired",
+    "TokenRefreshRequired",
+}
+
+
+class ExpiredCredentialsError(Exception):
+    """
+    Raised when an upload fails because the AWS credentials / session
+    token have expired or become invalid.
+
+    This is used to fail-fast out of an in-progress upload batch rather
+    than attempting to upload every remaining file with credentials that
+    are known to be dead. Callers are expected to catch this, re-resolve
+    credentials, and retry.
+    """
+
+    pass
+
+
+def is_expired_credentials_error(exc) -> bool:
+    """
+    Determine whether the given exception indicates expired / invalid AWS
+    credentials, for which retrying with the same credentials is futile.
+
+    Parameters
+    ----------
+    exc : Exception
+        exception raised during an upload
+
+    Returns
+    -------
+    bool
+        True if the exception represents an expired / invalid credential
+        error, else False
+    """
+    if isinstance(exc, ExpiredCredentialsError):
+        return True
+
+    # credentials could not be resolved at all / token retrieval failed
+    if isinstance(
+        exc,
+        (
+            s3_exceptions.NoCredentialsError,
+            s3_exceptions.CredentialRetrievalError,
+            s3_exceptions.TokenRetrievalError,
+        ),
+    ):
+        return True
+
+    # botocore ClientError carrying an expired-token style error code
+    if isinstance(exc, s3_exceptions.ClientError):
+        code = exc.response.get("Error", {}).get("Code")
+        if code in EXPIRED_CREDENTIAL_ERROR_CODES:
+            return True
+
+    return False
+
 
 def _build_boto3_session(aws_profile=None, aws_credentials=None):
     """
@@ -493,6 +558,20 @@ def multi_thread_upload(
                 local_file, remote_id = future.result()
                 uploaded_files[local_file] = remote_id
             except Exception as exc:
+                if is_expired_credentials_error(exc):
+                    # credentials have expired mid-batch; every remaining
+                    # file would fail the same way. Abort fast instead of
+                    # grinding through the rest, cancelling any not yet
+                    # started so the caller can re-resolve and retry.
+                    for pending in concurrent_jobs:
+                        pending.cancel()
+                    log.error(
+                        "AWS credentials expired while uploading, aborting"
+                        " this batch to retry with fresh credentials: %s",
+                        exc,
+                    )
+                    raise ExpiredCredentialsError(str(exc)) from exc
+
                 # catch any errors that may get raised from uploading, we
                 # will return a list of failed files to try reupload later
                 log.error(
@@ -562,6 +641,8 @@ def multi_core_upload(
         aws_credentials=aws_credentials,
     )
 
+    expired_credentials_exc = None
+
     for future in as_completed(concurrent_jobs):
         # access returned output as each is returned in any order
         try:
@@ -570,6 +651,16 @@ def multi_core_upload(
             all_uploaded_files = {**all_uploaded_files, **uploaded_files}
             all_failed_upload.extend(failed_upload)
         except Exception as exc:
+            if is_expired_credentials_error(exc):
+                # a child core aborted due to expired credentials; stop
+                # consuming the remaining cores and surface the abort so
+                # the caller can re-resolve credentials and retry. Cancel
+                # any cores not yet started to avoid more doomed work.
+                expired_credentials_exc = exc
+                for pending in concurrent_jobs:
+                    pending.cancel()
+                break
+
             # catch any other errors that might get raised from the
             # ProcessPool but not handled in the child ThreadPool
             all_failed_upload.extend(concurrent_jobs[future])
@@ -580,7 +671,20 @@ def multi_core_upload(
                 exc,
             )
 
-    pool_executor.shutdown(wait=True)
+    # don't wait on in-flight cores when aborting on expired credentials,
+    # they are using the same dead token and would only delay the retry
+    pool_executor.shutdown(wait=expired_credentials_exc is None)
+
+    if expired_credentials_exc is not None:
+        log.error(
+            "Aborting upload batch: AWS credentials expired. %s files"
+            " uploaded before abort; batch will be retried with fresh"
+            " credentials.",
+            len(all_uploaded_files),
+        )
+        raise ExpiredCredentialsError(
+            str(expired_credentials_exc)
+        ) from expired_credentials_exc
 
     if all_uploaded_files:
         log.info(
