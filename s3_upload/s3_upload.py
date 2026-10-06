@@ -1,4 +1,5 @@
 import argparse
+import logging
 from os import cpu_count, makedirs, path
 from pathlib import Path
 import sys
@@ -223,6 +224,26 @@ def parse_args() -> argparse.Namespace:
         "--log_dir",
         default="/var/log/s3_upload",
         help="Directory to write the sync state log to",
+    )
+    sync_parser.add_argument(
+        "--log_level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help=(
+            "Logging verbosity for the s3_upload logger (default: INFO)."
+            " Use DEBUG to log each file as it starts and finishes"
+            " uploading."
+        ),
+    )
+    sync_parser.add_argument(
+        "--debug_botocore",
+        default=False,
+        action="store_true",
+        help=(
+            "Enable botocore / boto3 wire-level debug logging (every HTTP"
+            " request, retry and signing step). Very verbose; use to"
+            " diagnose stalled or retrying uploads."
+        ),
     )
     sync_parser.add_argument(
         "--dry_run",
@@ -909,6 +930,21 @@ def main() -> None:
     if args.mode == "upload":
         upload_single_run(args)
     elif args.mode == "sync":
+        # sync logs to the console only (captured by SLURM); allow raising
+        # verbosity to DEBUG to see each file start/finish, and optionally
+        # turn on botocore wire logging to diagnose stalled / retrying
+        # uploads
+        log.setLevel(getattr(args, "log_level", "INFO"))
+
+        if getattr(args, "debug_botocore", False):
+            import boto3
+
+            boto3.set_stream_logging(name="botocore", level=logging.DEBUG)
+            boto3.set_stream_logging(name="boto3", level=logging.DEBUG)
+            boto3.set_stream_logging(
+                name="s3transfer", level=logging.DEBUG
+            )
+
         sync_single_run(args)
     else:
         config = read_config(config=args.config)
