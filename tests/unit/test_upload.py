@@ -16,81 +16,52 @@ class TestCheckAwsAccess(unittest.TestCase):
     @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", None)
     @patch("s3_upload.utils.upload.AWS_SECRET_KEY", None)
     @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", "baz")
-    def test_list_of_buckets_returned_on_aws_being_accessible_w_default_profile(
+    def test_no_error_when_default_profile_configured(
         self, mock_s3, mock_slack
     ):
+        """
+        check_aws_access only validates that authentication config is
+        present; with a profile set it should return None without exiting
+        and without listing buckets (that is check_buckets_exist's job).
+        """
+        self.assertIsNone(upload.check_aws_access())
 
-        mock_s3.return_value.resource.return_value.buckets.all.return_value = [
-            "bucket_1",
-            "bucket_2",
-        ]
-        returned_buckets = upload.check_aws_access()
+        with self.subTest("no bucket listing performed"):
+            mock_s3.return_value.resource.return_value.buckets.all.assert_not_called()
 
-        self.assertEqual(returned_buckets, ["bucket_1", "bucket_2"])
+        with self.subTest("no Slack alert sent"):
+            mock_slack.assert_not_called()
 
     @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", "foo")
     @patch("s3_upload.utils.upload.AWS_SECRET_KEY", "bar")
     @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", None)
-    def test_list_of_buckets_returned_on_aws_being_accessible_w_keys(
+    def test_no_error_when_access_keys_configured(
         self, mock_s3, mock_slack
     ):
+        self.assertIsNone(upload.check_aws_access())
 
-        mock_s3.return_value.resource.return_value.buckets.all.return_value = [
-            "bucket_1",
-            "bucket_2",
-        ]
-        returned_buckets = upload.check_aws_access()
+        with self.subTest("no bucket listing performed"):
+            mock_s3.return_value.resource.return_value.buckets.all.assert_not_called()
 
-        self.assertEqual(returned_buckets, ["bucket_1", "bucket_2"])
+        with self.subTest("no Slack alert sent"):
+            mock_slack.assert_not_called()
 
     @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", None)
     @patch("s3_upload.utils.upload.AWS_SECRET_KEY", None)
     @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", None)
-    def test_list_of_buckets_returned_on_aws_being_accessible_w_profile_from_config(
+    def test_no_error_when_profile_passed_as_argument(
         self, mock_s3, mock_slack
     ):
-        mock_s3.return_value.resource.return_value.buckets.all.return_value = [
-            "bucket_1",
-            "bucket_2",
-        ]
-
-        returned_buckets = upload.check_aws_access(
-            aws_profile="genomics-s3-write"
+        """
+        A profile passed explicitly (e.g. from config) satisfies the auth
+        check even when no profile / keys are set in the environment.
+        """
+        self.assertIsNone(
+            upload.check_aws_access(aws_profile="genomics-s3-write")
         )
 
-        self.assertEqual(returned_buckets, ["bucket_1", "bucket_2"])
-        self.assertEqual(
-            mock_s3.call_args.kwargs["profile_name"], "genomics-s3-write"
-        )
-
-    @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", None)
-    @patch("s3_upload.utils.upload.AWS_SECRET_KEY", None)
-    @patch("s3_upload.utils.upload.AWS_DEFAULT_PROFILE", "baz")
-    def test_runtime_error_raised_on_not_being_able_to_connect(
-        self, mock_s3, mock_slack
-    ):
-        mock_s3.side_effect = s3_exceptions.ClientError(
-            {"Error": {"Code": 1, "Message": "foo"}}, "bar"
-        )
-
-        expected_error = re.escape(
-            "Error in connecting to AWS: An error occurred (1) "
-            "when calling the bar operation: foo"
-        )
-
-        with pytest.raises(RuntimeError, match=expected_error):
-            upload.check_aws_access(slack_alert_webhook="my_webhook")
-
-        with self.subTest("correct Slack message sent"):
-            expected_slack_message = (
-                ":warning:  *S3 Upload*: Error in connecting to AWS!\n\n\t\tAn"
-                " error occurred (1) when calling the bar operation: foo"
-            )
-
-            self.assertEqual(
-                mock_slack.call_args[1]["message"],
-                expected_slack_message,
-            )
+        with self.subTest("no Slack alert sent"):
+            mock_slack.assert_not_called()
 
     @patch("s3_upload.utils.upload.AWS_ACCESS_KEY", "foo")
     @patch("s3_upload.utils.upload.AWS_SECRET_KEY", "bar")
@@ -364,7 +335,10 @@ class TestMultiThreadUpload(unittest.TestCase):
             ),
         ]
 
-        self.assertEqual(
+        # files are uploaded concurrently across threads, so the order of
+        # the recorded calls is not deterministic; compare as an unordered
+        # collection
+        self.assertCountEqual(
             expected_call_args_for_all_calls, mock_upload.call_args_list
         )
 
@@ -475,6 +449,9 @@ class TestMultiThreadUpload(unittest.TestCase):
             self.assertEqual(failed_files, ["file2.txt", "file3.txt"])
 
 
+@patch("s3_upload.utils.upload._resolve_credentials", return_value={
+    "access_key": "a", "secret_key": "b"
+})
 class TestMultiCoreUpload(unittest.TestCase):
 
     local_files = [
@@ -486,7 +463,7 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload.as_completed")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_correct_number_of_process_pools_set_from_cores_arg(
-        self, mock_pool, mock_completed
+        self, mock_pool, mock_completed, mock_resolve
     ):
         for core in [1, 4]:
             with self.subTest(f"{core} core(s) set to use"):
@@ -504,7 +481,7 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload._submit_to_pool")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_returned_file_mapping_correct_for_all_successfully_uploading(
-        self, mock_pool, mock_submit, mock_completed
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
     ):
         # each ProcessPool should return a dict mapping from each ThreadPool
         # of local file to remote object ID, these should then be finally
@@ -565,7 +542,7 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload._submit_to_pool")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_returned_file_mapping_correct_for_failed_upload_in_child_thread(
-        self, mock_pool, mock_submit, mock_completed
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
     ):
         """
         Test that if an error occurs in the child ThreadPoolExecutor and
@@ -635,7 +612,7 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload._submit_to_pool")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_exception_correctly_handled_from_parent_process(
-        self, mock_pool, mock_submit, mock_completed
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
     ):
         """
         Test that if an error occurs in one of the main ProcessPoolExecutors
