@@ -126,6 +126,11 @@ def parse_args() -> argparse.Namespace:
         help="Remote path in bucket to upload sequencing dir to",
     )
     upload_parser.add_argument(
+        "--aws_profile",
+        default=None,
+        help="AWS profile to use for authentication",
+    )
+    upload_parser.add_argument(
         "--skip_check",
         default=False,
         action="store_true",
@@ -269,8 +274,10 @@ def upload_single_run(args) -> None:
     args : argparse.NameSpace
         parsed command line arguments
     """
-    check_aws_access()
-    check_buckets_exist(buckets=[args.bucket])
+    aws_profile = getattr(args, "aws_profile", None)
+
+    check_aws_access(aws_profile=aws_profile)
+    check_buckets_exist(buckets=[args.bucket], aws_profile=aws_profile)
 
     if not args.skip_check:
         log.info(
@@ -305,6 +312,7 @@ def upload_single_run(args) -> None:
             cores=args.cores,
             threads=args.threads,
             parent_path=parent_path,
+            aws_profile=aws_profile,
         )
     except ExpiredCredentialsError:
         log.error(

@@ -5,6 +5,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
 )
+import multiprocessing as mp
 from os import environ, path
 import re
 import sys
@@ -539,13 +540,24 @@ def multi_thread_upload(
         "s3",
         endpoint_url=AWS_S3_ENDPOINT_URL,
         config=Config(
-            retries={"total_max_attempts": 10, "mode": "standard"},
+            # explicit timeouts so a stalled connection raises instead of
+            # blocking a thread indefinitely; a raised timeout surfaces as
+            # a failed file (retried on the next pass) rather than a hang
+            connect_timeout=30,
+            read_timeout=120,
+            retries={"total_max_attempts": 3, "mode": "standard"},
             max_pool_connections=100,
         ),
     )
 
     uploaded_files = {}
     failed_upload = []
+
+    total_files = len(files)
+    # log a progress line periodically so long uploads are not silent
+    # between the start and end of the batch
+    heartbeat_every = max(1, min(100, total_files // 10 or 1))
+    completed = 0
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         concurrent_jobs = _submit_to_pool(
@@ -564,6 +576,13 @@ def multi_thread_upload(
             try:
                 local_file, remote_id = future.result()
                 uploaded_files[local_file] = remote_id
+                completed += 1
+                if completed % heartbeat_every == 0:
+                    log.info(
+                        "Upload progress: %s/%s files uploaded on this core",
+                        completed,
+                        total_files,
+                    )
             except Exception as exc:
                 if is_expired_credentials_error(exc):
                     # credentials have expired mid-batch; every remaining
@@ -630,12 +649,21 @@ def multi_core_upload(
     all_uploaded_files = {}
     all_failed_upload = []
 
-    # Resolve credentials in the parent process so child processes
-    # don't need to invoke the credential helper (which may not work
-    # across process boundaries with signing helpers like Roles Anywhere)
-    aws_credentials = _resolve_credentials(aws_profile=aws_profile)
-
-    pool_executor = ProcessPoolExecutor(max_workers=cores)
+    # Pass the AWS profile (not pre-resolved credentials) down to each
+    # worker so that every worker builds its own boto3 session from the
+    # profile's credential provider. For a refreshable provider such as
+    # IAM Roles Anywhere (credential_process), botocore then re-invokes
+    # the signing helper to mint a fresh token when the current one nears
+    # expiry, so uploads no longer fail once a frozen token would have
+    # expired mid-pass.
+    #
+    # A "spawn" context is used so each worker is a clean interpreter that
+    # can invoke the credential helper reliably, rather than inheriting
+    # (potentially locked / partially initialised) state from the parent
+    # via fork.
+    pool_executor = ProcessPoolExecutor(
+        max_workers=cores, mp_context=mp.get_context("spawn")
+    )
     concurrent_jobs = _submit_to_pool(
         pool=pool_executor,
         func=multi_thread_upload,
@@ -645,7 +673,7 @@ def multi_core_upload(
         remote_path=remote_path,
         parent_path=parent_path,
         threads=threads,
-        aws_credentials=aws_credentials,
+        aws_profile=aws_profile,
     )
 
     expired_credentials_exc = None

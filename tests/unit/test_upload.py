@@ -480,6 +480,44 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload.as_completed")
     @patch("s3_upload.utils.upload._submit_to_pool")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
+    def test_profile_forwarded_to_workers_and_credentials_not_frozen(
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
+    ):
+        """
+        Workers must build their own session from the AWS profile (so a
+        refreshable credential_process provider can refresh mid-run); the
+        parent must NOT pre-resolve / freeze credentials. Verify the
+        profile is forwarded to multi_thread_upload and that
+        _resolve_credentials is not called.
+        """
+        mock_completed.return_value = []
+        mock_submit.return_value = {}
+
+        upload.multi_core_upload(
+            files=self.local_files,
+            bucket="test_bucket",
+            remote_path="/",
+            cores=1,
+            threads=1,
+            parent_path="/path/to/monitored_dir/",
+            aws_profile="genomics-s3-write",
+        )
+
+        with self.subTest("credentials not pre-resolved/frozen in parent"):
+            mock_resolve.assert_not_called()
+
+        with self.subTest("profile forwarded to worker submission"):
+            submit_kwargs = mock_submit.call_args[1]
+            self.assertEqual(
+                submit_kwargs.get("aws_profile"), "genomics-s3-write"
+            )
+
+        with self.subTest("frozen credentials not passed to workers"):
+            self.assertNotIn("aws_credentials", mock_submit.call_args[1])
+
+    @patch("s3_upload.utils.upload.as_completed")
+    @patch("s3_upload.utils.upload._submit_to_pool")
+    @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_returned_file_mapping_correct_for_all_successfully_uploading(
         self, mock_pool, mock_submit, mock_completed, mock_resolve
     ):
