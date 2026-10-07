@@ -71,15 +71,22 @@ def is_expired_credentials_error(exc) -> bool:
     if isinstance(exc, ExpiredCredentialsError):
         return True
 
-    # credentials could not be resolved at all / token retrieval failed
-    if isinstance(
-        exc,
-        (
-            s3_exceptions.NoCredentialsError,
-            s3_exceptions.CredentialRetrievalError,
-            s3_exceptions.TokenRetrievalError,
-        ),
-    ):
+    # credentials could not be resolved at all / token retrieval failed.
+    # Some of these exception classes are only present in newer botocore
+    # versions, so resolve them defensively and skip any that are absent
+    # rather than raising AttributeError on older botocore (e.g. the
+    # botocore bundled with Python 3.6).
+    credential_error_classes = tuple(
+        cls
+        for cls in (
+            getattr(s3_exceptions, "NoCredentialsError", None),
+            getattr(s3_exceptions, "CredentialRetrievalError", None),
+            getattr(s3_exceptions, "TokenRetrievalError", None),
+        )
+        if cls is not None
+    )
+
+    if credential_error_classes and isinstance(exc, credential_error_classes):
         return True
 
     # botocore ClientError carrying an expired-token style error code

@@ -950,6 +950,33 @@ class TestIsExpiredCredentialsError(unittest.TestCase):
             upload.is_expired_credentials_error(ValueError("nope"))
         )
 
+    def test_detection_does_not_crash_on_older_botocore(self):
+        """
+        Regression: older botocore (e.g. the version bundled with the
+        Python 3.6 venv on the HPC) does not define TokenRetrievalError /
+        CredentialRetrievalError. The detector must not raise
+        AttributeError when those attributes are absent; it should still
+        correctly classify an ExpiredToken ClientError.
+        """
+        import botocore.exceptions as be
+
+        with patch.object(be, "TokenRetrievalError", create=True), patch(
+            "s3_upload.utils.upload.s3_exceptions"
+        ) as mock_exc:
+            # simulate an older botocore: ClientError / NoCredentialsError
+            # present, but the newer token attrs missing
+            mock_exc.ClientError = s3_exceptions.ClientError
+            mock_exc.NoCredentialsError = s3_exceptions.NoCredentialsError
+            del mock_exc.TokenRetrievalError
+            del mock_exc.CredentialRetrievalError
+
+            # must not raise, and must still detect the expired token
+            self.assertTrue(
+                upload.is_expired_credentials_error(
+                    _client_error("ExpiredToken")
+                )
+            )
+
 
 @patch("s3_upload.utils.upload.as_completed")
 @patch("s3_upload.utils.upload.upload_single_file")
