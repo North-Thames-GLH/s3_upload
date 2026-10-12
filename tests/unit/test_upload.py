@@ -518,6 +518,58 @@ class TestMultiCoreUpload(unittest.TestCase):
     @patch("s3_upload.utils.upload.as_completed")
     @patch("s3_upload.utils.upload._submit_to_pool")
     @patch("s3_upload.utils.upload.ProcessPoolExecutor")
+    def test_mp_context_not_passed_on_python_36(
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
+    ):
+        """
+        Regression: ProcessPoolExecutor only accepts the mp_context
+        keyword on Python 3.7+. On the Python 3.6 interpreter used on the
+        HPC it must not be passed, or construction raises TypeError.
+        """
+        mock_completed.return_value = []
+        mock_submit.return_value = {}
+
+        with patch("s3_upload.utils.upload.sys") as mock_sys:
+            mock_sys.version_info = (3, 6)
+
+            upload.multi_core_upload(
+                files=self.local_files,
+                bucket="test_bucket",
+                remote_path="/",
+                cores=1,
+                threads=1,
+                parent_path="/path/to/monitored_dir/",
+            )
+
+        self.assertNotIn("mp_context", mock_pool.call_args[1])
+
+    @patch("s3_upload.utils.upload.as_completed")
+    @patch("s3_upload.utils.upload._submit_to_pool")
+    @patch("s3_upload.utils.upload.ProcessPoolExecutor")
+    def test_mp_context_passed_on_python_37_plus(
+        self, mock_pool, mock_submit, mock_completed, mock_resolve
+    ):
+        """On Python 3.7+ the spawn mp_context should be passed."""
+        mock_completed.return_value = []
+        mock_submit.return_value = {}
+
+        with patch("s3_upload.utils.upload.sys") as mock_sys:
+            mock_sys.version_info = (3, 10)
+
+            upload.multi_core_upload(
+                files=self.local_files,
+                bucket="test_bucket",
+                remote_path="/",
+                cores=1,
+                threads=1,
+                parent_path="/path/to/monitored_dir/",
+            )
+
+        self.assertIn("mp_context", mock_pool.call_args[1])
+
+    @patch("s3_upload.utils.upload.as_completed")
+    @patch("s3_upload.utils.upload._submit_to_pool")
+    @patch("s3_upload.utils.upload.ProcessPoolExecutor")
     def test_returned_file_mapping_correct_for_all_successfully_uploading(
         self, mock_pool, mock_submit, mock_completed, mock_resolve
     ):

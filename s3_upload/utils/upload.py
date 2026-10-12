@@ -657,13 +657,18 @@ def multi_core_upload(
     # expiry, so uploads no longer fail once a frozen token would have
     # expired mid-pass.
     #
-    # A "spawn" context is used so each worker is a clean interpreter that
-    # can invoke the credential helper reliably, rather than inheriting
-    # (potentially locked / partially initialised) state from the parent
-    # via fork.
-    pool_executor = ProcessPoolExecutor(
-        max_workers=cores, mp_context=mp.get_context("spawn")
-    )
+    # A "spawn" context is preferred so each worker is a clean interpreter
+    # that can invoke the credential helper reliably, rather than
+    # inheriting (potentially locked / partially initialised) state from
+    # the parent via fork. The mp_context argument to ProcessPoolExecutor
+    # is only supported on Python 3.7+, so fall back to the default
+    # context on older interpreters (e.g. the Python 3.6 on the HPC).
+    if sys.version_info >= (3, 7):
+        pool_executor = ProcessPoolExecutor(
+            max_workers=cores, mp_context=mp.get_context("spawn")
+        )
+    else:
+        pool_executor = ProcessPoolExecutor(max_workers=cores)
     concurrent_jobs = _submit_to_pool(
         pool=pool_executor,
         func=multi_thread_upload,
