@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from glob import glob
 from itertools import zip_longest
-from os import path, scandir, stat
+from os import path, scandir, stat, walk
 from pathlib import Path
 import re
 from typing import List, Tuple, Union
@@ -726,6 +726,35 @@ def split_file_list_by_cores(files, n) -> List[List[str]]:
     return files
 
 
+def get_run_directory_snapshot(run_dir) -> dict:
+    """Snapshot directory entries so new files/directories can be noticed.
+
+    This deliberately stats directories rather than every file. Run folders
+    can contain tens of thousands of files on a network mount, while
+    ``CopyComplete.txt`` indicates the copied files should otherwise be
+    stable. Directory mtimes and entry names detect additions/removals during
+    the post-copy quiet period without repeatedly statting every large file.
+    """
+    snapshot = {}
+    for current_dir, dir_names, file_names in walk(run_dir):
+        relative_dir = path.relpath(current_dir, run_dir)
+        try:
+            directory_stat = stat(current_dir)
+        except OSError:
+            # Treat an unreadable directory as a changing snapshot. The next
+            # pass will retry, and final sync remains the authoritative check.
+            snapshot[relative_dir] = None
+            continue
+
+        snapshot[relative_dir] = (
+            getattr(directory_stat, "st_mtime_ns", directory_stat.st_mtime),
+            tuple(sorted(dir_names)),
+            tuple(sorted(file_names)),
+        )
+
+    return snapshot
+
+
 def verify_config(config) -> None:
     """
     Verify that config structure and parameters are valid
@@ -761,6 +790,30 @@ def verify_config(config) -> None:
         config.get("live_cbcl_finalize_completed_runs", True), bool
     ):
         errors.append("live_cbcl_finalize_completed_runs must be a boolean")
+
+    if not isinstance(config.get("live_cbcl_exit_on_complete", False), bool):
+        errors.append("live_cbcl_exit_on_complete must be a boolean")
+
+    quiet_values = {}
+    for key in (
+        "live_cbcl_quiet_seconds",
+        "live_cbcl_quiet_check_interval_seconds",
+    ):
+        value = config.get(key, 600 if key == "live_cbcl_quiet_seconds" else 60)
+        if type(value) is not int or value <= 0:
+            errors.append(f"{key} must be a positive integer")
+        else:
+            quiet_values[key] = value
+
+    if (
+        len(quiet_values) == 2
+        and quiet_values["live_cbcl_quiet_check_interval_seconds"]
+        > quiet_values["live_cbcl_quiet_seconds"]
+    ):
+        errors.append(
+            "live_cbcl_quiet_check_interval_seconds must not exceed "
+            "live_cbcl_quiet_seconds"
+        )
 
     if config.get("aws_profile") and not isinstance(config.get("aws_profile"), str):
         errors.append("aws_profile must be a string")

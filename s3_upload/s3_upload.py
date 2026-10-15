@@ -1,8 +1,9 @@
 import argparse
 import logging
-from os import cpu_count, makedirs, path
+from os import cpu_count, makedirs, path, replace, unlink
 from pathlib import Path
 import sys
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 import time
 from timeit import default_timer as timer
 
@@ -10,6 +11,7 @@ from utils.io import (
     acquire_lock,
     read_config,
     read_live_upload_state_log,
+    read_samplesheet_from_run_directory,
     write_live_upload_state_to_log,
     write_sync_state_to_log,
     write_upload_state_to_log,
@@ -24,8 +26,10 @@ from utils.upload import (
 from utils.utils import (
     check_is_sequencing_run_dir,
     check_termination_file_exists,
+    check_all_uploadable_samples,
     compute_missing_files,
     get_live_cbcl_files,
+    get_run_directory_snapshot,
     get_runs_to_live_upload,
     get_runs_to_upload,
     get_sequencing_file_list,
@@ -332,7 +336,7 @@ def upload_single_run(args) -> None:
     )
 
 
-def sync_single_run(args) -> None:
+def sync_single_run(args, return_report=False):
     """
     Reconcile a single local run directory against its S3 prefix and
     upload only the files that are missing or size-mismatched.
@@ -349,6 +353,9 @@ def sync_single_run(args) -> None:
     ----------
     args : argparse.Namespace
         parsed command line arguments
+    return_report : bool
+        return the mapping of files uploaded during this sync; used by the
+        live completion quiet-period handler
     """
     aws_profile = args.aws_profile
     run_dir = args.local_path
@@ -400,7 +407,20 @@ def sync_single_run(args) -> None:
 
         if not missing:
             log.info("Run %s fully synced", run_id)
-            return
+            if cumulative_uploaded or path.exists(log_file):
+                write_sync_state_to_log(
+                    run_id=run_id,
+                    run_path=run_dir,
+                    log_file=log_file,
+                    total_local=len(local_files),
+                    total_remote=len(remote),
+                    uploaded_files=cumulative_uploaded,
+                    failed_files=cumulative_failed,
+                    passes=attempt,
+                )
+            if return_report:
+                return cumulative_uploaded
+            return None
 
         if args.dry_run:
             for f in missing:
@@ -411,7 +431,7 @@ def sync_single_run(args) -> None:
                 len(missing),
                 run_id,
             )
-            return
+            return {} if return_report else None
 
         split = split_file_list_by_cores(files=missing, n=args.cores)
 
@@ -755,6 +775,206 @@ def monitor_directories_for_live_cbcl_upload(
     log.info("Polling interval set to %s seconds", poll_interval)
 
     poll_count = 0
+    exit_on_complete = config.get("live_cbcl_exit_on_complete", False)
+    managed_live_runs = {}
+    completed_live_runs = set()
+
+    def run_key(run_config):
+        return (
+            run_config["run_dir"],
+            run_config["bucket"],
+            run_config["remote_path"],
+        )
+
+    def build_run_config(run_dir, monitor_dir_config):
+        return {
+            "run_dir": run_dir,
+            "run_id": Path(run_dir).name,
+            "parent_path": Path(run_dir).parent,
+            "bucket": monitor_dir_config["bucket"],
+            "remote_path": monitor_dir_config["remote_path"],
+            "live_lanes": monitor_dir_config.get("live_lanes"),
+            "grace_seconds": grace_seconds
+            if grace_seconds is not None
+            else monitor_dir_config.get(
+                "live_cycle_grace_seconds",
+                config.get("live_cycle_grace_seconds", 120),
+            ),
+        }
+
+    def matches_sample_filter(run_dir, monitor_dir_config):
+        sample_pattern = monitor_dir_config.get("sample_regex")
+        if not sample_pattern:
+            return True
+        samplesheet = read_samplesheet_from_run_directory(run_dir)
+        return bool(samplesheet) and check_all_uploadable_samples(
+            samplesheet_contents=samplesheet,
+            sample_pattern=sample_pattern,
+        )
+
+    def sync_run(run_config):
+        sync_args = argparse.Namespace(
+            local_path=run_config["run_dir"],
+            bucket=run_config["bucket"],
+            remote_path=run_config["remote_path"],
+            aws_profile=aws_profile,
+            cores=cores,
+            threads=threads,
+            max_passes=20,
+            backoff_seconds=60,
+            log_dir=log_dir,
+            dry_run=False,
+        )
+        return sync_single_run(sync_args, return_report=True) or {}
+
+    def remote_completion_marker_size(run_config):
+        marker_key = path.join(
+            run_config["remote_path"],
+            run_config["run_id"],
+            "S3UploadComplete.txt",
+        ).lstrip("/")
+        remote_objects = list_remote_objects(
+            run_config["bucket"], marker_key, aws_profile
+        )
+        return remote_objects.get(marker_key)
+
+    def write_local_completion_marker(run_config):
+        marker_path = path.join(
+            run_config["run_dir"], "S3UploadComplete.txt"
+        )
+        temporary_path = None
+        try:
+            with NamedTemporaryFile(
+                mode="wb",
+                prefix=".S3UploadComplete.",
+                suffix=".tmp",
+                dir=run_config["run_dir"],
+                delete=False,
+            ) as marker_file:
+                temporary_path = marker_file.name
+            replace(temporary_path, marker_path)
+        finally:
+            if temporary_path and path.exists(temporary_path):
+                unlink(temporary_path)
+
+    def publish_completion_marker(run_config):
+        run_id = run_config["run_id"]
+        remote_run_path = path.join(
+            run_config["remote_path"], run_id
+        )
+
+        # Upload from a temporary location first. The final local marker is
+        # published only after S3 confirms the object, so a local watcher
+        # cannot trigger analysis before the S3 marker exists.
+        with TemporaryDirectory(prefix="s3-upload-complete-") as temp_dir:
+            staged_marker = path.join(temp_dir, "S3UploadComplete.txt")
+            with open(staged_marker, "wb"):
+                pass
+
+            uploaded, failed = multi_core_upload(
+                files=[[(staged_marker, 0)]],
+                bucket=run_config["bucket"],
+                remote_path=remote_run_path,
+                cores=1,
+                threads=1,
+                parent_path=temp_dir,
+                aws_profile=aws_profile,
+            )
+
+            if failed or staged_marker not in uploaded:
+                log.error(
+                    "Failed publishing S3UploadComplete.txt for %s",
+                    run_id,
+                )
+                sys.exit(1)
+
+        write_local_completion_marker(run_config)
+        log.info(
+            "S3UploadComplete.txt is present in the local run folder and "
+            "uploaded to %s:%s",
+            run_config["bucket"],
+            path.join(remote_run_path, "S3UploadComplete.txt"),
+        )
+
+    def finalize_completed_run(run_config):
+        marker_path = path.join(
+            run_config["run_dir"], "S3UploadComplete.txt"
+        )
+        remote_marker_size = remote_completion_marker_size(run_config)
+        if remote_marker_size == 0:
+            if not path.exists(marker_path) or path.getsize(marker_path) != 0:
+                write_local_completion_marker(run_config)
+            log.info(
+                "Run %s already has S3UploadComplete.txt in S3; "
+                "treating it as finalized",
+                run_config["run_id"],
+            )
+            return
+        if remote_marker_size is not None:
+            log.warning(
+                "Existing S3UploadComplete.txt for %s is not empty; "
+                "it will be replaced after final verification",
+                run_config["run_id"],
+            )
+
+        sync_run(run_config)
+        quiet_seconds = config.get("live_cbcl_quiet_seconds", 600)
+        check_interval = config.get(
+            "live_cbcl_quiet_check_interval_seconds", 60
+        )
+        snapshot = get_run_directory_snapshot(run_config["run_dir"])
+        quiet_since = time.monotonic()
+        log.info(
+            "Run %s synced; starting %s-second quiet period before final "
+            "verification",
+            run_config["run_id"],
+            quiet_seconds,
+        )
+
+        while True:
+            remaining = quiet_seconds - (time.monotonic() - quiet_since)
+            if remaining > 0:
+                time.sleep(min(check_interval, remaining))
+                current_snapshot = get_run_directory_snapshot(
+                    run_config["run_dir"]
+                )
+                if current_snapshot != snapshot:
+                    log.info(
+                        "Run %s changed during the quiet period; syncing "
+                        "new files and restarting the timer",
+                        run_config["run_id"],
+                    )
+                    sync_run(run_config)
+                    snapshot = get_run_directory_snapshot(
+                        run_config["run_dir"]
+                    )
+                    quiet_since = time.monotonic()
+                continue
+
+            # A final S3 reconciliation is authoritative. If it finds and
+            # uploads anything, restart the quiet period from that point.
+            uploaded = sync_run(run_config)
+            current_snapshot = get_run_directory_snapshot(
+                run_config["run_dir"]
+            )
+            if uploaded or current_snapshot != snapshot:
+                log.info(
+                    "Run %s needed additional files during final "
+                    "verification; restarting the quiet timer",
+                    run_config["run_id"],
+                )
+                snapshot = current_snapshot
+                quiet_since = time.monotonic()
+                continue
+            break
+
+        log.info(
+            "Run %s fully synced with no new files needed for %s seconds; "
+            "publishing S3UploadComplete.txt",
+            run_config["run_id"],
+            quiet_seconds,
+        )
+        publish_completion_marker(run_config)
 
     while True:
         poll_count += 1
@@ -766,28 +986,32 @@ def monitor_directories_for_live_cbcl_upload(
             if monitor_dir_config.get("live_cbcl") is False:
                 continue
 
+            # A run-scoped Slurm job may start after RTAComplete has already
+            # made the ordinary live-run discovery skip this directory.
+            # Track direct run-directory configs so root CopyComplete can
+            # still drive finalization.
+            for monitored_dir in monitor_dir_config.get(
+                "monitored_directories", []
+            ):
+                if (
+                    check_is_sequencing_run_dir(monitored_dir)
+                    and matches_sample_filter(monitored_dir, monitor_dir_config)
+                ):
+                    direct_run = build_run_config(
+                        monitored_dir, monitor_dir_config
+                    )
+                    managed_live_runs[run_key(direct_run)] = direct_run
+
             live_runs = get_runs_to_live_upload(
                 monitor_dirs=monitor_dir_config.get("monitored_directories"),
                 sample_pattern=monitor_dir_config.get("sample_regex"),
             )
 
             for run_dir in live_runs:
-                runs_to_upload.append(
-                    {
-                        "run_dir": run_dir,
-                        "run_id": Path(run_dir).name,
-                        "parent_path": Path(run_dir).parent,
-                        "bucket": monitor_dir_config["bucket"],
-                        "remote_path": monitor_dir_config["remote_path"],
-                        "live_lanes": monitor_dir_config.get("live_lanes"),
-                        "grace_seconds": grace_seconds
-                        if grace_seconds is not None
-                        else monitor_dir_config.get(
-                            "live_cycle_grace_seconds",
-                            config.get("live_cycle_grace_seconds", 120),
-                        ),
-                    }
-                )
+                run_config = build_run_config(run_dir, monitor_dir_config)
+                runs_to_upload.append(run_config)
+                if exit_on_complete:
+                    managed_live_runs[run_key(run_config)] = run_config
 
         if not runs_to_upload:
             log.info("No active sequencing runs requiring live cbcl upload found.")
@@ -914,7 +1138,34 @@ def monitor_directories_for_live_cbcl_upload(
         # run termination without requiring a separate monitor invocation.
         # Skip finalisation if credentials expired this cycle; it would only
         # fail the same way. The next poll cycle re-resolves credentials.
-        if credentials_expired:
+        if exit_on_complete and not dry_run and not credentials_expired:
+            for key, run_config in list(managed_live_runs.items()):
+                if key in completed_live_runs:
+                    continue
+                if not path.exists(
+                    path.join(run_config["run_dir"], "CopyComplete.txt")
+                ):
+                    continue
+
+                log.info(
+                    "Root CopyComplete.txt found for %s; finalizing the "
+                    "complete run",
+                    run_config["run_id"],
+                )
+                finalize_completed_run(run_config)
+                completed_live_runs.add(key)
+
+            if managed_live_runs and len(completed_live_runs) == len(
+                managed_live_runs
+            ):
+                log.info(
+                    "All %s tracked sequencing runs have S3UploadComplete.txt; "
+                    "live CBCL job exiting successfully",
+                    len(managed_live_runs),
+                )
+                return
+
+        elif credentials_expired:
             log.info(
                 "Skipping finalisation this cycle due to expired credentials"
             )

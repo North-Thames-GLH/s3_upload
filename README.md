@@ -80,6 +80,21 @@ Available inputs for `live_cbcl`:
 * `--dry_run` (optional): calls everything except the actual upload to check what `.cbcl` files would be uploaded
 * `--grace_seconds` (optional): override minimum age in seconds for `.cbcl` files to be considered stable for upload
 
+For a run-scoped Slurm job that should finish after a run is copied, set
+`live_cbcl_exit_on_complete` to `true`. When the root `CopyComplete.txt`
+appears, `live_cbcl` reconciles the full run against S3, waits for a quiet
+period, and reconciles again. New directory entries reset the quiet period;
+the final reconciliation must find no missing or size-mismatched files. The
+job then uploads an empty `S3UploadComplete.txt` to the run's S3 prefix,
+publishes the same marker in the local run folder, logs success, and exits
+with status 0. The completion marker is published after the quiet period, so
+it does not restart the timer. If reconciliation or marker upload fails, the
+job exits nonzero and does not publish a new local completion marker.
+
+This option defaults to `false` to preserve the existing continuous-monitor
+behavior. It is intended for a monitored path that names one run directory;
+the example live-CBCL config enables it for its run-specific path.
+
 
 Available inputs for `sync`:
 * `--local_path` (required): path to the run directory to reconcile against S3
@@ -105,6 +120,9 @@ The top level keys that may be defined include:
 * `max_threads` (`int` | optional): the maximum number of threads to use per CPU core
 * `max_age` (`int` | optional): maximum age in hours of a complete run to monitor for upload, determined from mtime of `RunInfo.xml` (default: 72h). For example, setting `max_age: 48` will only upload runs created (or `RunInfo.xml` modified) within the last 48 hours.
 * `live_cycle_grace_seconds` (`int` | optional): minimum age in seconds for `.cbcl` files from closed cycles to be considered stable for `live_cbcl` upload (default: 120)
+* `live_cbcl_exit_on_complete` (`bool` | optional): when `true`, finalize a run after its root `CopyComplete.txt` appears, wait for a quiet window, publish `S3UploadComplete.txt` locally and in S3, then exit successfully (default: `false`)
+* `live_cbcl_quiet_seconds` (`int` | optional): required quiet period after the first complete S3 sync (default: 600)
+* `live_cbcl_quiet_check_interval_seconds` (`int` | optional): interval for checking run-directory entries during the quiet period (default: 60)
 * `aws_profile` (`str` | optional): AWS profile name to use with boto3, for example `genomics-s3-write`
 * `log_level` (`str` | optional): the level of logging to set, available options are defined [here](https://docs.python.org/3/library/logging.html#logging-levels)
 * `log_dir` (`str` | optional): path to where to store logs (default: `/var/log/s3_upload`)
