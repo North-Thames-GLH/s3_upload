@@ -65,6 +65,18 @@ def parse_args():
         "samplesheet",
         help="Path to the pool samplesheet CSV (e.g. Pool_8888.hpc.csv).",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["live", "finished"],
+        default="live",
+        help=(
+            "Upload route this sbatch drives. 'live' (default) monitors an"
+            " in-progress run with the live_cbcl config and self-exits once"
+            " the run completes and the marker is published. 'finished'"
+            " runs a one-shot sync of a completed run folder and publishes"
+            " the S3UploadComplete.txt marker (no config file)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -110,16 +122,25 @@ def parse_samplesheet(samplesheet_path):
 
 
 def build_config(run_id):
-    """Build the live_cbcl config dict for the given run."""
+    """
+    Build the live_cbcl config dict for the given run (live mode only).
+
+    We set ``live_cbcl_exit_on_complete`` at the TOP LEVEL of the config so
+    the long-lived live_cbcl process finalizes completed runs and then exits
+    cleanly once every tracked run has published its S3UploadComplete.txt
+    marker. (It is read from the top level of the config in s3_upload.py, not
+    from inside the per-directory ``monitor[0]`` block.)
+    """
     config = json.loads(json.dumps(CONFIG_TEMPLATE))  # deep copy
     config["monitor"][0]["monitored_directories"] = [
         f"{RUNS_BASE_DIR}/{run_id}"
     ]
+    config["live_cbcl_exit_on_complete"] = True
     return config
 
 
-def build_sbatch(pool_id, config_rel_path, out_rel_path, err_rel_path):
-    """Build the sbatch script text."""
+def build_live_sbatch(pool_id, config_rel_path, out_rel_path, err_rel_path):
+    """Build the sbatch script text for the live_cbcl (in-progress) route."""
     lines = [
         "#!/bin/bash",
         f"#SBATCH --time={TIME_LIMIT}",
@@ -133,6 +154,37 @@ def build_sbatch(pool_id, config_rel_path, out_rel_path, err_rel_path):
         (
             "python3 s3_upload/s3_upload.py live_cbcl"
             f" --config {config_rel_path}"
+        ),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_finished_sbatch(pool_id, run_id, out_rel_path, err_rel_path):
+    """
+    Build the sbatch script text for the finished (sequencing complete)
+    route: a one-shot sync of the whole run folder that publishes the
+    S3UploadComplete.txt marker once the sync is clean and the termination
+    file is present. No config file is written for this route.
+    """
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --time={TIME_LIMIT}",
+        f"#SBATCH --job-name={JOB_NAME_PREFIX}_{pool_id}",
+        f"#SBATCH -p {PARTITION}",
+        f"#SBATCH --output={out_rel_path}",
+        f"#SBATCH --error={err_rel_path}",
+        "",
+        f"cd {REMOTE_REPO_DIR}",
+        f"source {VENV_ACTIVATE}",
+        (
+            "python3 s3_upload/s3_upload.py sync"
+            f" --local_path {RUNS_BASE_DIR}/{run_id}"
+            " --bucket development-bucket-input"
+            " --remote_path 1.runs/"
+            " --aws_profile genomics-s3-write"
+            " --max_passes 20"
+            " --publish-complete-marker"
         ),
         "",
     ]
@@ -153,15 +205,21 @@ def main():
     err_rel = f"{UPLOAD_LOGS_DIRNAME}/{pool_id}/{pool_id}.err"
     sbatch_rel = f"{UPLOAD_LOGS_DIRNAME}/{pool_id}/{pool_id}.sbatch"
 
-    config = build_config(run_id)
-    (REPO_DIR / config_rel).write_text(json.dumps(config, indent=4) + "\n")
+    if args.mode == "live":
+        config = build_config(run_id)
+        (REPO_DIR / config_rel).write_text(json.dumps(config, indent=4) + "\n")
+        sbatch = build_live_sbatch(pool_id, config_rel, out_rel, err_rel)
+    else:
+        # finished route: whole-folder sync + marker publish, no config file
+        sbatch = build_finished_sbatch(pool_id, run_id, out_rel, err_rel)
 
-    sbatch = build_sbatch(pool_id, config_rel, out_rel, err_rel)
     (REPO_DIR / sbatch_rel).write_text(sbatch)
 
     print(f"run_id:  {run_id}")
     print(f"pool_id: {pool_id}")
-    print(f"Wrote config:  {config_rel}")
+    print(f"mode:    {args.mode}")
+    if args.mode == "live":
+        print(f"Wrote config:  {config_rel}")
     print(f"Wrote sbatch:  {sbatch_rel}")
 
 

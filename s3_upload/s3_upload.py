@@ -260,6 +260,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Report missing files that would be uploaded without uploading",
     )
+    sync_parser.add_argument(
+        "--publish-complete-marker",
+        default=False,
+        action="store_true",
+        help=(
+            "On a clean sync, verify the run's local termination file"
+            " (CopyComplete.txt / RTAComplete) is present and then publish"
+            " the S3UploadComplete.txt handshake marker (S3 first, then the"
+            " local run folder). If the termination file is missing the run"
+            " is not finished, so nothing is published and sync exits"
+            " non-zero. Setting this flag also raises --max_passes to at"
+            " least 20. Ignored under --dry_run."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -381,6 +395,20 @@ def sync_single_run(args, return_report=False):
         args.log_dir, "uploads", "{}.sync.log.json".format(run_id)
     )
 
+    # When we are going to publish the completion marker the sync must be
+    # allowed enough passes to drain a full run folder (not just a handful of
+    # live-cbcl gaps), so clamp max_passes up to a sensible floor.
+    if getattr(args, "publish_complete_marker", False):
+        clamped_max_passes = max(args.max_passes, 20)
+        if clamped_max_passes != args.max_passes:
+            log.info(
+                "--publish-complete-marker set; raising --max_passes from"
+                " %s to %s",
+                args.max_passes,
+                clamped_max_passes,
+            )
+            args.max_passes = clamped_max_passes
+
     # cumulative counts across passes for the sync state log
     cumulative_uploaded = {}
     cumulative_failed = []
@@ -418,6 +446,41 @@ def sync_single_run(args, return_report=False):
                     failed_files=cumulative_failed,
                     passes=attempt,
                 )
+
+            if getattr(args, "publish_complete_marker", False):
+                if args.dry_run:
+                    # A dry run must not touch S3 or the local run folder;
+                    # just surface what a real run would do.
+                    log.info(
+                        "--dry_run specified; S3UploadComplete.txt WOULD be"
+                        " published for %s if the termination file guard"
+                        " passes",
+                        run_id,
+                    )
+                else:
+                    # Only a genuinely finished run gets the handshake
+                    # marker. The termination file (CopyComplete.txt /
+                    # RTAComplete) is the authoritative "sequencing done"
+                    # signal; without it a clean sync just means "nothing
+                    # new right now", not "run complete".
+                    if not check_termination_file_exists(run_dir):
+                        log.error(
+                            "Run %s is fully synced but has no termination"
+                            " file (CopyComplete.txt / RTAComplete) in %s;"
+                            " refusing to publish S3UploadComplete.txt",
+                            run_id,
+                            run_dir,
+                        )
+                        sys.exit(1)
+
+                    publish_completion_marker(
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        bucket=args.bucket,
+                        remote_path=args.remote_path,
+                        aws_profile=args.aws_profile,
+                    )
+
             if return_report:
                 return cumulative_uploaded
             return None
@@ -497,6 +560,121 @@ def sync_single_run(args, return_report=False):
         len(missing),
     )
     sys.exit(1)
+
+
+def write_local_completion_marker(run_dir: str) -> None:
+    """
+    Atomically write an empty ``S3UploadComplete.txt`` into the local run
+    directory.
+
+    The marker is written to a temporary file in the same directory and then
+    ``os.replace``'d into place so a local watcher never observes a partially
+    written marker. The caller is responsible for ordering: in the upload
+    handshake this is only ever called *after* the S3 object has been
+    confirmed, so the presence of the local marker also implies the remote
+    marker exists.
+
+    Parameters
+    ----------
+    run_dir : str
+        path to the local run directory to write the marker into
+    """
+    marker_path = path.join(run_dir, "S3UploadComplete.txt")
+    temporary_path = None
+    try:
+        with NamedTemporaryFile(
+            mode="wb",
+            prefix=".S3UploadComplete.",
+            suffix=".tmp",
+            dir=run_dir,
+            delete=False,
+        ) as marker_file:
+            temporary_path = marker_file.name
+        replace(temporary_path, marker_path)
+    finally:
+        if temporary_path and path.exists(temporary_path):
+            unlink(temporary_path)
+
+
+def publish_completion_marker(
+    *,
+    run_dir,
+    run_id,
+    bucket,
+    remote_path,
+    aws_profile,
+    cores=1,
+    threads=1,
+) -> None:
+    """
+    Publish the ``S3UploadComplete.txt`` handshake marker for a completed
+    run, S3 first and the local run folder second.
+
+    This is the single code path both upload routes share:
+
+      * the live_cbcl finalizer calls it once a run has reached its quiet
+        period, and
+      * ``sync --publish-complete-marker`` calls it once a sync is clean and
+        the local termination file has been verified.
+
+    The marker is uploaded from a throwaway temporary file to
+    ``<remote_path>/<run_id>/S3UploadComplete.txt`` first. Only once S3 has
+    confirmed the object do we write the local marker, so a local watcher can
+    never trigger downstream analysis before the authoritative S3 marker
+    exists. Any upload failure logs an error and exits non-zero so callers do
+    not report a false completion.
+
+    Parameters
+    ----------
+    run_dir : str
+        path to the local run directory
+    run_id : str
+        run identifier (leaf of the remote key)
+    bucket : str
+        S3 bucket to publish the marker into
+    remote_path : str
+        remote parent prefix the run directory lives under
+    aws_profile : str | None
+        AWS profile to use for authentication
+    cores : int
+        cores for the single marker upload (default 1)
+    threads : int
+        threads for the single marker upload (default 1)
+    """
+    remote_run_path = path.join(remote_path, run_id)
+
+    # Upload from a temporary location first. The final local marker is
+    # published only after S3 confirms the object, so a local watcher
+    # cannot trigger analysis before the S3 marker exists.
+    with TemporaryDirectory(prefix="s3-upload-complete-") as temp_dir:
+        staged_marker = path.join(temp_dir, "S3UploadComplete.txt")
+        with open(staged_marker, "wb"):
+            pass
+
+        uploaded, failed = multi_core_upload(
+            files=[[(staged_marker, 0)]],
+            bucket=bucket,
+            remote_path=remote_run_path,
+            cores=cores,
+            threads=threads,
+            parent_path=temp_dir,
+            aws_profile=aws_profile,
+        )
+
+        if failed or staged_marker not in uploaded:
+            log.error(
+                "Failed publishing S3UploadComplete.txt for %s",
+                run_id,
+            )
+            sys.exit(1)
+
+    write_local_completion_marker(run_dir)
+    log.info(
+        "S3UploadComplete.txt is present in the local run folder and "
+        "uploaded to %s:%s",
+        bucket,
+        path.join(remote_run_path, "S3UploadComplete.txt"),
+    )
 
 
 def monitor_directories_for_upload(config, dry_run) -> None:
@@ -838,64 +1016,6 @@ def monitor_directories_for_live_cbcl_upload(
         )
         return remote_objects.get(marker_key)
 
-    def write_local_completion_marker(run_config):
-        marker_path = path.join(
-            run_config["run_dir"], "S3UploadComplete.txt"
-        )
-        temporary_path = None
-        try:
-            with NamedTemporaryFile(
-                mode="wb",
-                prefix=".S3UploadComplete.",
-                suffix=".tmp",
-                dir=run_config["run_dir"],
-                delete=False,
-            ) as marker_file:
-                temporary_path = marker_file.name
-            replace(temporary_path, marker_path)
-        finally:
-            if temporary_path and path.exists(temporary_path):
-                unlink(temporary_path)
-
-    def publish_completion_marker(run_config):
-        run_id = run_config["run_id"]
-        remote_run_path = path.join(
-            run_config["remote_path"], run_id
-        )
-
-        # Upload from a temporary location first. The final local marker is
-        # published only after S3 confirms the object, so a local watcher
-        # cannot trigger analysis before the S3 marker exists.
-        with TemporaryDirectory(prefix="s3-upload-complete-") as temp_dir:
-            staged_marker = path.join(temp_dir, "S3UploadComplete.txt")
-            with open(staged_marker, "wb"):
-                pass
-
-            uploaded, failed = multi_core_upload(
-                files=[[(staged_marker, 0)]],
-                bucket=run_config["bucket"],
-                remote_path=remote_run_path,
-                cores=1,
-                threads=1,
-                parent_path=temp_dir,
-                aws_profile=aws_profile,
-            )
-
-            if failed or staged_marker not in uploaded:
-                log.error(
-                    "Failed publishing S3UploadComplete.txt for %s",
-                    run_id,
-                )
-                sys.exit(1)
-
-        write_local_completion_marker(run_config)
-        log.info(
-            "S3UploadComplete.txt is present in the local run folder and "
-            "uploaded to %s:%s",
-            run_config["bucket"],
-            path.join(remote_run_path, "S3UploadComplete.txt"),
-        )
-
     def finalize_completed_run(run_config):
         marker_path = path.join(
             run_config["run_dir"], "S3UploadComplete.txt"
@@ -903,7 +1023,7 @@ def monitor_directories_for_live_cbcl_upload(
         remote_marker_size = remote_completion_marker_size(run_config)
         if remote_marker_size == 0:
             if not path.exists(marker_path) or path.getsize(marker_path) != 0:
-                write_local_completion_marker(run_config)
+                write_local_completion_marker(run_config["run_dir"])
             log.info(
                 "Run %s already has S3UploadComplete.txt in S3; "
                 "treating it as finalized",
@@ -974,7 +1094,13 @@ def monitor_directories_for_live_cbcl_upload(
             run_config["run_id"],
             quiet_seconds,
         )
-        publish_completion_marker(run_config)
+        publish_completion_marker(
+            run_dir=run_config["run_dir"],
+            run_id=run_config["run_id"],
+            bucket=run_config["bucket"],
+            remote_path=run_config["remote_path"],
+            aws_profile=aws_profile,
+        )
 
     while True:
         poll_count += 1
