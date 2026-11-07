@@ -47,6 +47,7 @@ def _build_sync_args(**overrides):
         backoff_seconds=60,
         log_dir="/var/log/s3_upload",
         dry_run=False,
+        publish_complete_marker=False,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -367,6 +368,229 @@ class TestSyncSingleRun(unittest.TestCase):
             mock_multi_core.assert_not_called()
 
 
+@patch("s3_upload.s3_upload.publish_completion_marker")
+@patch("s3_upload.s3_upload.check_termination_file_exists")
+@patch("s3_upload.s3_upload.time.sleep")
+@patch("s3_upload.s3_upload.write_sync_state_to_log")
+@patch("s3_upload.s3_upload.split_file_list_by_cores")
+@patch("s3_upload.s3_upload.multi_core_upload")
+@patch("s3_upload.s3_upload.compute_missing_files")
+@patch("s3_upload.s3_upload.list_remote_objects")
+@patch("s3_upload.s3_upload.get_sequencing_file_list")
+@patch("s3_upload.s3_upload.Path")
+@patch("s3_upload.s3_upload.check_buckets_exist")
+@patch("s3_upload.s3_upload.check_aws_access")
+class TestSyncPublishCompleteMarker(unittest.TestCase):
+    """
+    Behaviour of `sync --publish-complete-marker`: the handshake marker is
+    published only on a clean sync AND only when the run's termination file
+    is present; the termination-file guard is authoritative; --dry_run never
+    publishes; and setting the flag clamps max_passes up to a floor of 20.
+
+    Both collaborators that touch the outside world
+    (`check_termination_file_exists` and `publish_completion_marker`) are
+    patched at module level so these tests stay focused on the branch logic
+    in `sync_single_run`.
+    """
+
+    def _configure_common(
+        self, mock_path, mock_get_files, run_dir_exists=True
+    ):
+        mock_path_instance = mock_path.return_value
+        mock_path_instance.exists.return_value = run_dir_exists
+        mock_path_instance.name = "run1"
+        mock_path_instance.parent = "/parent"
+        mock_get_files.return_value = [
+            "/parent/run1/file_1.txt",
+            "/parent/run1/file_2.txt",
+        ]
+
+    def test_clean_sync_with_termination_file_publishes_marker(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """clean sync + termination file present => marker published once"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+        mock_check_termination.return_value = True
+
+        result = sync_single_run(
+            _build_sync_args(publish_complete_marker=True)
+        )
+
+        with self.subTest("returns without raising"):
+            self.assertIsNone(result)
+        with self.subTest("termination guard consulted with run_dir"):
+            mock_check_termination.assert_called_once_with("/parent/run1")
+        with self.subTest("marker published with the contract values"):
+            mock_publish.assert_called_once_with(
+                run_dir="/parent/run1",
+                run_id="run1",
+                bucket="test_bucket",
+                remote_path="/",
+                aws_profile="my-profile",
+            )
+        with self.subTest("no files uploaded on an already-clean sync"):
+            mock_multi_core.assert_not_called()
+
+    def test_clean_sync_without_termination_file_exits_non_zero_no_publish(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """clean sync but no termination file => non-zero exit, no publish"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+        mock_check_termination.return_value = False
+
+        with self.subTest("SystemExit raised with non-zero code"):
+            with self.assertRaises(SystemExit) as ctx:
+                sync_single_run(
+                    _build_sync_args(publish_complete_marker=True)
+                )
+            self.assertEqual(ctx.exception.code, 1)
+        with self.subTest("nothing published"):
+            mock_publish.assert_not_called()
+
+    def test_dry_run_never_runs_guard_or_publishes(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """--dry_run with the flag set publishes nothing and skips the guard"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+
+        result = sync_single_run(
+            _build_sync_args(publish_complete_marker=True, dry_run=True)
+        )
+
+        with self.subTest("returns without raising"):
+            self.assertIsNone(result)
+        with self.subTest("termination guard never consulted"):
+            mock_check_termination.assert_not_called()
+        with self.subTest("nothing published"):
+            mock_publish.assert_not_called()
+
+    def test_flag_clamps_max_passes_up_to_floor(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """a sub-floor --max_passes is raised to 20 when the flag is set"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+        mock_check_termination.return_value = True
+
+        args = _build_sync_args(publish_complete_marker=True, max_passes=3)
+        sync_single_run(args)
+
+        with self.subTest("max_passes raised to the floor"):
+            self.assertEqual(args.max_passes, 20)
+
+    def test_flag_does_not_lower_a_higher_max_passes(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """a higher --max_passes is preserved, not clamped down"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+        mock_check_termination.return_value = True
+
+        args = _build_sync_args(publish_complete_marker=True, max_passes=50)
+        sync_single_run(args)
+
+        with self.subTest("higher max_passes preserved"):
+            self.assertEqual(args.max_passes, 50)
+
+    def test_flag_unset_never_publishes(
+        self,
+        mock_check_access,
+        mock_check_buckets,
+        mock_path,
+        mock_get_files,
+        mock_list_remote,
+        mock_compute_missing,
+        mock_multi_core,
+        mock_split,
+        mock_write_log,
+        mock_sleep,
+        mock_check_termination,
+        mock_publish,
+    ):
+        """without the flag a clean sync publishes nothing and keeps passes"""
+        self._configure_common(mock_path, mock_get_files)
+        mock_list_remote.return_value = {"run1/file_1.txt": 1}
+        mock_compute_missing.return_value = []
+
+        args = _build_sync_args(publish_complete_marker=False, max_passes=3)
+        sync_single_run(args)
+
+        with self.subTest("guard never consulted"):
+            mock_check_termination.assert_not_called()
+        with self.subTest("nothing published"):
+            mock_publish.assert_not_called()
+        with self.subTest("max_passes untouched"):
+            self.assertEqual(args.max_passes, 3)
+
+
 class TestParseArgsSubcommandDispatch(unittest.TestCase):
     """
     Regression tests for the argparse subcommand dispatch.
@@ -507,6 +731,26 @@ class TestParseArgsSubcommandDispatch(unittest.TestCase):
             self.assertEqual(args.backoff_seconds, 60)
         with self.subTest("dry_run default"):
             self.assertFalse(args.dry_run)
+        with self.subTest("publish_complete_marker default"):
+            self.assertFalse(args.publish_complete_marker)
+
+    def test_sync_subcommand_publish_complete_marker_flag(self):
+        """--publish-complete-marker parses to publish_complete_marker=True"""
+        args = self._parse(
+            [
+                "sync",
+                "--local_path",
+                "/data/run1",
+                "--bucket",
+                "my-bucket",
+                "--publish-complete-marker",
+            ]
+        )
+
+        with self.subTest("mode"):
+            self.assertEqual(args.mode, "sync")
+        with self.subTest("publish_complete_marker set"):
+            self.assertTrue(args.publish_complete_marker)
 
     def test_no_subcommand_errors_out(self):
         """the existing `args.mode is None` guard still applies (7.1)"""
