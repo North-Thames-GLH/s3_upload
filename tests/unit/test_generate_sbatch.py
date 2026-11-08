@@ -60,8 +60,8 @@ class TestBuildConfig(unittest.TestCase):
     """live-mode config places the exit flag at the top level."""
 
     def test_exit_on_complete_at_top_level(self):
-        run_id, _ = gs.parse_samplesheet(SAMPLESHEET_FIXTURE)
-        config = gs.build_config(run_id)
+        run_id, pool_id = gs.parse_samplesheet(SAMPLESHEET_FIXTURE)
+        config = gs.build_config(run_id, pool_id)
 
         with self.subTest("flag present at top level and True"):
             self.assertTrue(config.get("live_cbcl_exit_on_complete"))
@@ -74,6 +74,22 @@ class TestBuildConfig(unittest.TestCase):
                 config["monitor"][0]["monitored_directories"],
                 [f"{gs.RUNS_BASE_DIR}/{run_id}"],
             )
+
+    def test_log_dir_points_at_pool_folder(self):
+        # The uploader defaults log_dir to the unwritable /var/log/s3_upload;
+        # the live config must instead point it at the pool's own
+        # upload_logs/<pool_id>/ folder so the SLURM job can write state logs.
+        run_id, pool_id = gs.parse_samplesheet(SAMPLESHEET_FIXTURE)
+        config = gs.build_config(run_id, pool_id)
+
+        with self.subTest("log_dir is the per-pool relative folder"):
+            self.assertEqual(
+                config["log_dir"],
+                f"{gs.UPLOAD_LOGS_DIRNAME}/{pool_id}",
+            )
+        with self.subTest("log_dir is not the unwritable system default"):
+            self.assertNotEqual(config["log_dir"], "/var/log/s3_upload")
+            self.assertNotIn("/var/log", config["log_dir"])
 
 
 class TestBuildLiveSbatch(unittest.TestCase):
@@ -138,9 +154,15 @@ class TestBuildFinishedSbatch(unittest.TestCase):
                 " --remote_path 1.runs/"
                 " --aws_profile genomics-s3-write"
                 " --max_passes 20"
+                f" --log_dir {gs.UPLOAD_LOGS_DIRNAME}/{pool_id}"
                 " --publish-complete-marker"
             )
             self.assertIn(expected, sbatch)
+        with self.subTest("log_dir is the pool folder, not /var/log"):
+            self.assertIn(
+                f" --log_dir {gs.UPLOAD_LOGS_DIRNAME}/{pool_id}", sbatch
+            )
+            self.assertNotIn("/var/log", sbatch)
 
 
 class TestParseArgsMode(unittest.TestCase):
