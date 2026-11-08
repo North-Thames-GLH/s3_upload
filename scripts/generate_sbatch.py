@@ -34,7 +34,15 @@ VENV_ACTIVATE = ".venv/bin/activate"
 PARTITION = "low-level"
 TIME_LIMIT = "48:00:00"
 
-# Fixed config template. Only monitored_directories is filled in per run.
+# Fixed config template. `monitored_directories` and `log_dir` are filled in
+# per run (see build_config).
+#
+# Note: `log_dir` is deliberately NOT hard-coded here. The uploader defaults it
+# to /var/log/s3_upload, which the SLURM job user cannot write to (it crashes
+# with PermissionError the moment it tries to write a state log). We point it at
+# the pool's own upload_logs/<pool_id>/ folder instead — the same place the
+# .sbatch/.out/.err already live — so all of a pool's upload artifacts stay
+# together and land under a directory the job can write to.
 CONFIG_TEMPLATE = {
     "max_cores": 1,
     "max_threads": 4,
@@ -42,7 +50,6 @@ CONFIG_TEMPLATE = {
     "live_cycle_grace_seconds": 30,
     "aws_profile": "genomics-s3-write",
     "log_level": "INFO",
-    "log_dir": "/tmp/s3_upload_logs",
     "monitor": [
         {
             "monitored_directories": [],
@@ -52,6 +59,20 @@ CONFIG_TEMPLATE = {
         }
     ],
 }
+
+
+def pool_log_dir_rel(pool_id):
+    """
+    Per-pool state-log directory, relative to the repo root the sbatch job
+    cd's into before running.
+
+    Both routes point the uploader's ``log_dir`` here so its per-run state logs
+    (which the uploader writes to ``<log_dir>/uploads/<run_id>.*.log.json``)
+    land alongside the pool's .sbatch/.out/.err rather than in the unwritable
+    system default (/var/log/s3_upload). Keeping it relative means it resolves
+    under REMOTE_REPO_DIR, exactly like the other upload_logs/<pool_id>/ paths.
+    """
+    return f"{UPLOAD_LOGS_DIRNAME}/{pool_id}"
 
 
 def parse_args():
@@ -121,7 +142,7 @@ def parse_samplesheet(samplesheet_path):
     return run_id, pool_id
 
 
-def build_config(run_id):
+def build_config(run_id, pool_id):
     """
     Build the live_cbcl config dict for the given run (live mode only).
 
@@ -130,11 +151,16 @@ def build_config(run_id):
     cleanly once every tracked run has published its S3UploadComplete.txt
     marker. (It is read from the top level of the config in s3_upload.py, not
     from inside the per-directory ``monitor[0]`` block.)
+
+    ``log_dir`` is set to the pool's upload_logs/<pool_id>/ folder so the
+    uploader's state logs are writable by the SLURM job and sit with the rest
+    of the pool's upload artifacts (see pool_log_dir_rel).
     """
     config = json.loads(json.dumps(CONFIG_TEMPLATE))  # deep copy
     config["monitor"][0]["monitored_directories"] = [
         f"{RUNS_BASE_DIR}/{run_id}"
     ]
+    config["log_dir"] = pool_log_dir_rel(pool_id)
     config["live_cbcl_exit_on_complete"] = True
     return config
 
@@ -184,6 +210,7 @@ def build_finished_sbatch(pool_id, run_id, out_rel_path, err_rel_path):
             " --remote_path 1.runs/"
             " --aws_profile genomics-s3-write"
             " --max_passes 20"
+            f" --log_dir {pool_log_dir_rel(pool_id)}"
             " --publish-complete-marker"
         ),
         "",
@@ -206,7 +233,7 @@ def main():
     sbatch_rel = f"{UPLOAD_LOGS_DIRNAME}/{pool_id}/{pool_id}.sbatch"
 
     if args.mode == "live":
-        config = build_config(run_id)
+        config = build_config(run_id, pool_id)
         (REPO_DIR / config_rel).write_text(json.dumps(config, indent=4) + "\n")
         sbatch = build_live_sbatch(pool_id, config_rel, out_rel, err_rel)
     else:
