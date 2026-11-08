@@ -651,8 +651,13 @@ def publish_completion_marker(
         with open(staged_marker, "wb"):
             pass
 
+        # multi_core_upload expects a list (per core) of plain string file
+        # paths — the same shape split_file_list_by_cores produces and
+        # upload_single_file consumes. Passing a (path, size) tuple here made
+        # upload_single_file hand a tuple to derive_remote_key, which raised
+        # "expected string or bytes-like object" and failed the marker publish.
         uploaded, failed = multi_core_upload(
-            files=[[(staged_marker, 0)]],
+            files=[[staged_marker]],
             bucket=bucket,
             remote_path=remote_run_path,
             cores=cores,
