@@ -28,7 +28,11 @@ REPO_ROOT = os.path.abspath(
 sys.path.append(REPO_ROOT)
 sys.path.append(os.path.join(REPO_ROOT, "s3_upload"))
 
-from s3_upload.s3_upload import parse_args, sync_single_run
+from s3_upload.s3_upload import (
+    parse_args,
+    publish_completion_marker,
+    sync_single_run,
+)
 
 
 def _build_sync_args(**overrides):
@@ -756,6 +760,80 @@ class TestParseArgsSubcommandDispatch(unittest.TestCase):
         """the existing `args.mode is None` guard still applies (7.1)"""
         with self.assertRaises(SystemExit):
             self._parse([])
+
+
+@patch("s3_upload.s3_upload.write_local_completion_marker")
+@patch("s3_upload.s3_upload.multi_core_upload")
+class TestPublishCompletionMarker(unittest.TestCase):
+    """
+    Regression tests for the REAL `publish_completion_marker` body.
+
+    The sync-branch tests above patch `publish_completion_marker` out, so
+    they never exercised how it calls `multi_core_upload`. A shape bug slipped
+    through there: the marker was passed as `files=[[(path, 0)]]` — a
+    (path, size) TUPLE — but `multi_core_upload`/`upload_single_file` expect
+    plain string paths (the shape `split_file_list_by_cores` produces). That
+    made `derive_remote_key` raise "expected string or bytes-like object" and
+    the marker publish failed in production. These tests call the real
+    function with only `multi_core_upload` (and the local-marker writer)
+    mocked, and assert the `files` argument is a list-of-lists of strings.
+    """
+
+    def test_files_argument_is_list_of_plain_string_paths(
+        self, mock_multi_core, mock_write_local
+    ):
+        """the marker is handed to multi_core_upload as a bare string path"""
+        # multi_core_upload returns (uploaded, failed). publish_completion_marker
+        # checks `staged_marker not in uploaded`, so echo the uploaded path back
+        # by capturing whatever string path it was given.
+        captured = {}
+
+        def _fake_upload(*, files, **kwargs):
+            captured["files"] = files
+            # the staged marker is the single item in the single core-batch
+            staged = files[0][0]
+            return ({staged: "etag"}, [])
+
+        mock_multi_core.side_effect = _fake_upload
+
+        publish_completion_marker(
+            run_dir="/parent/run1",
+            run_id="run1",
+            bucket="test_bucket",
+            remote_path="1.runs/",
+            aws_profile="my-profile",
+        )
+
+        files = captured["files"]
+        with self.subTest("outer structure is a list of core-batches"):
+            self.assertIsInstance(files, list)
+            self.assertEqual(len(files), 1)
+            self.assertIsInstance(files[0], list)
+            self.assertEqual(len(files[0]), 1)
+        with self.subTest("the single item is a plain string, not a tuple"):
+            item = files[0][0]
+            self.assertIsInstance(item, str)
+            self.assertNotIsInstance(item, tuple)
+            self.assertTrue(item.endswith("S3UploadComplete.txt"))
+        with self.subTest("local marker written after S3 confirms"):
+            mock_write_local.assert_called_once_with("/parent/run1")
+
+    def test_publish_exits_non_zero_when_upload_fails(
+        self, mock_multi_core, mock_write_local
+    ):
+        """a failed marker upload is fatal and writes no local marker"""
+        mock_multi_core.return_value = ({}, ["/tmp/x/S3UploadComplete.txt"])
+
+        with self.assertRaises(SystemExit) as ctx:
+            publish_completion_marker(
+                run_dir="/parent/run1",
+                run_id="run1",
+                bucket="test_bucket",
+                remote_path="1.runs/",
+                aws_profile="my-profile",
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        mock_write_local.assert_not_called()
 
 
 if __name__ == "__main__":
